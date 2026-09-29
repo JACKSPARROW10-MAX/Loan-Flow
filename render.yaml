@@ -2,76 +2,81 @@
 #  LoanFlow – Render Blueprint (render.yaml)
 #  Deploys all FastAPI services to Render.
 #  Frontend is deployed separately on Vercel.
+#  Services live in the Loan-Flow project / loanflow-env environment,
+#  because the env group "loanflow-env" is scoped to that environment.
 # ═══════════════════════════════════════════════════════
 
-services:
-  - type: web
-    name: loanflow-gateway
-    runtime: docker
-    plan: free
-    dockerfilePath: services/gateway/Dockerfile
-    dockerContext: .
-    envVars:
-      - fromGroup: loanflow-env
-    healthCheckPath: /health
+projects:
+  - name: Loan-Flow
+    environments:
+      - name: loanflow-env
+        services:
+          - type: web
+            name: loanflow-gateway
+            runtime: docker
+            plan: free
+            dockerfilePath: services/gateway/Dockerfile
+            dockerContext: .
+            envVars:
+              - fromGroup: loanflow-env
+            healthCheckPath: /health
 
-  - type: web
-    name: loanflow-auth
-    runtime: docker
-    plan: free
-    dockerfilePath: services/auth/Dockerfile
-    dockerContext: .
-    envVars:
-      - fromGroup: loanflow-env
-    healthCheckPath: /health
+          - type: web
+            name: loanflow-auth
+            runtime: docker
+            plan: free
+            dockerfilePath: services/auth/Dockerfile
+            dockerContext: .
+            envVars:
+              - fromGroup: loanflow-env
+            healthCheckPath: /health
 
-  - type: web
-    name: loanflow-loan-app
-    runtime: docker
-    plan: free
-    dockerfilePath: services/loan_app/Dockerfile
-    dockerContext: .
-    envVars:
-      - fromGroup: loanflow-env
-    healthCheckPath: /health
+          - type: web
+            name: loanflow-loan-app
+            runtime: docker
+            plan: free
+            dockerfilePath: services/loan_app/Dockerfile
+            dockerContext: .
+            envVars:
+              - fromGroup: loanflow-env
+            healthCheckPath: /health
 
-  - type: web
-    name: loanflow-mock-kyc
-    runtime: docker
-    plan: free
-    dockerfilePath: services/mock_kyc/Dockerfile
-    dockerContext: .
-    envVars:
-      - fromGroup: loanflow-env
-    healthCheckPath: /health
+          - type: web
+            name: loanflow-mock-kyc
+            runtime: docker
+            plan: free
+            dockerfilePath: services/mock_kyc/Dockerfile
+            dockerContext: .
+            envVars:
+              - fromGroup: loanflow-env
+            healthCheckPath: /health
 
-  - type: web
-    name: loanflow-risk
-    runtime: docker
-    plan: free
-    dockerfilePath: services/risk/Dockerfile
-    dockerContext: .
-    envVars:
-      - fromGroup: loanflow-env
-    healthCheckPath: /health
+          - type: web
+            name: loanflow-risk
+            runtime: docker
+            plan: free
+            dockerfilePath: services/risk/Dockerfile
+            dockerContext: .
+            envVars:
+              - fromGroup: loanflow-env
+            healthCheckPath: /health
 
-  - type: web
-    name: loanflow-audit
-    runtime: docker
-    plan: free
-    dockerfilePath: services/audit/Dockerfile
-    dockerContext: .
-    envVars:
-      - fromGroup: loanflow-env
-    healthCheckPath: /health
+          - type: web
+            name: loanflow-audit
+            runtime: docker
+            plan: free
+            dockerfilePath: services/audit/Dockerfile
+            dockerContext: .
+            envVars:
+              - fromGroup: loanflow-env
+            healthCheckPath: /health
 
-  - type: web
-    name: loanflow-document
-    runtime: docker
-    plan: free
-    dockerfilePath: services/document/Dockerfile
-    dockerContext: .
-    envVars:
-      - fromGroup: loanflow-env
-    healthCheckPath: /health
-
+          - type: web
+            name: loanflow-document
+            runtime: docker
+            plan: free
+            dockerfilePath: services/document/Dockerfile
+            dockerContext: .
+            envVars:
+              - fromGroup: loanflow-env
+            healthCheckPath: /health
