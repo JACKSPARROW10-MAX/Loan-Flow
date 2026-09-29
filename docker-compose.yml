@@ -1,0 +1,83 @@
+# ═══════════════════════════════════════════════════════════════
+#  LoanFlow – Local Development (services only)
+#  Infrastructure (Postgres, Redis, Storage) is cloud-hosted:
+#    - Database:  Supabase
+#    - Cache:     Upstash Redis
+#    - Storage:   Supabase Storage
+# ═══════════════════════════════════════════════════════════════
+
+services:
+  gateway:
+    build:
+      context: ./services/gateway
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    env_file: .env
+    depends_on:
+      - auth
+      - loan_app
+      - document
+      - mock_kyc
+      - risk
+      - audit
+
+  auth:
+    build:
+      context: ./services/auth
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8001"
+    env_file: .env
+
+  loan_app:
+    build:
+      context: ./services/loan_app
+      dockerfile: Dockerfile
+    ports:
+      - "8002:8002"
+    env_file: .env
+
+  document:
+    build:
+      context: ./services/document
+      dockerfile: Dockerfile
+    ports:
+      - "8003:8003"
+    env_file: .env
+
+  mock_kyc:
+    build:
+      context: ./services/mock_kyc
+      dockerfile: Dockerfile
+    ports:
+      - "8004:8004"
+    env_file: .env
+
+  risk:
+    build:
+      context: ./services/risk
+      dockerfile: Dockerfile
+    ports:
+      - "8005:8005"
+    env_file: .env
+
+  audit:
+    build:
+      context: ./services/audit
+      dockerfile: Dockerfile
+    ports:
+      - "8006:8006"
+    env_file: .env
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
+    depends_on:
+      - gateway
+

@@ -1,0 +1,70 @@
+# ═══════════════════════════════════════════════════════
+#  LoanFlow – Render Blueprint (render.yaml)
+#  Deploys all FastAPI services to Render.
+#  Frontend is deployed separately on Vercel.
+# ═══════════════════════════════════════════════════════
+
+services:
+  - type: web
+    name: loanflow-gateway
+    runtime: docker
+    dockerfilePath: services/gateway/Dockerfile
+    dockerContext: .
+    envVars:
+      - fromGroup: loanflow-env
+    healthCheckPath: /health
+
+  - type: web
+    name: loanflow-auth
+    runtime: docker
+    dockerfilePath: services/auth/Dockerfile
+    dockerContext: .
+    envVars:
+      - fromGroup: loanflow-env
+    healthCheckPath: /health
+
+  - type: web
+    name: loanflow-loan-app
+    runtime: docker
+    dockerfilePath: services/loan_app/Dockerfile
+    dockerContext: .
+    envVars:
+      - fromGroup: loanflow-env
+    healthCheckPath: /health
+
+  - type: web
+    name: loanflow-mock-kyc
+    runtime: docker
+    dockerfilePath: services/mock_kyc/Dockerfile
+    dockerContext: .
+    envVars:
+      - fromGroup: loanflow-env
+    healthCheckPath: /health
+
+  - type: web
+    name: loanflow-risk
+    runtime: docker
+    dockerfilePath: services/risk/Dockerfile
+    dockerContext: .
+    envVars:
+      - fromGroup: loanflow-env
+    healthCheckPath: /health
+
+  - type: web
+    name: loanflow-audit
+    runtime: docker
+    dockerfilePath: services/audit/Dockerfile
+    dockerContext: .
+    envVars:
+      - fromGroup: loanflow-env
+    healthCheckPath: /health
+
+  - type: web
+    name: loanflow-document
+    runtime: docker
+    dockerfilePath: services/document/Dockerfile
+    dockerContext: .
+    envVars:
+      - fromGroup: loanflow-env
+    healthCheckPath: /health
+
