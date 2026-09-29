@@ -47,15 +47,7 @@ export const Navbar: React.FC<NavbarProps> = ({
             <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-[#FFBA00] to-[#BB8A52] flex items-center justify-center shadow-md text-[#0C3B2E]">
               <Landmark className="w-6 h-6 stroke-[2.2]" />
             </div>
-            <div>
-              <div className="flex items-center space-x-1.5">
-                <span className="text-xl font-bold tracking-tight text-white">LoanFlow</span>
-                <span className="text-[10px] font-semibold tracking-wider uppercase px-1.5 py-0.5 rounded bg-[#FFBA00] text-[#0C3B2E]">
-                  v5.0
-                </span>
-              </div>
-              <p className="text-[11px] text-[#8eb494]">Digital Origination & Servicing</p>
-            </div>
+            <span className="text-xl font-bold tracking-tight text-white">LoanFlow</span>
           </div>
 
           {/* Navigation Views */}
