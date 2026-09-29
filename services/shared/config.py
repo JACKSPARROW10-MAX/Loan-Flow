@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     kyc_service_url: str = "http://localhost:8004"
     risk_service_url: str = "http://localhost:8005"
     audit_service_url: str = "http://localhost:8006"
+    notification_service_url: str = "http://localhost:8007"
+
+    # CORS: comma-separated allowed origins
+    cors_origins: str = "http://localhost:3000"
 
     class Config:
         env_file = ".env"

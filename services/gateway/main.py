@@ -40,7 +40,7 @@ app = FastAPI(title="LoanFlow API Gateway", version="1.0.0")
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=[o.strip() for o in settings.cors_origins.split(",") if o.strip()],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -59,9 +59,9 @@ SERVICE_MAP = {
     "/collection": settings.loan_app_service_url,
     "/analytics": settings.loan_app_service_url,
     "/fraud": settings.loan_app_service_url,
-    "/notifications": "http://localhost:8007",
-    "/notify": "http://localhost:8007",
-    "/ws": "http://localhost:8007",
+    "/notifications": settings.notification_service_url,
+    "/notify": settings.notification_service_url,
+    "/ws": settings.notification_service_url,
     "/kyc": settings.kyc_service_url,
     "/score": settings.risk_service_url,
     "/audit": settings.audit_service_url,
