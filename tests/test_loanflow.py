@@ -768,3 +768,56 @@ def test_database_is_postgresql():
     assert "postgresql" in url or "postgres" in url, \
         f"Tests MUST use PostgreSQL. Current DATABASE_URL engine: {url}"
     assert "sqlite" not in url, f"SQLite detected — forbidden! URL: {url}"
+
+
+# ═══════════════════════ TEST 13 — Registration approval workflow ═══════════════════════
+
+def test_registration_requires_approval():
+    """New customers need an officer, new officers need a manager, before they can log in."""
+    async def _run():
+        transport = ASGITransport(app=auth_app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            emp = get_auth_cookies("emp-201", "employee", "rahul_maker")
+            mgr = get_auth_cookies("mgr-301", "manager", "priya_checker")
+
+            # Managers cannot self-register
+            r = await client.post("/auth/register", json={
+                "username": "sneaky", "email": "s@x.com", "password": "pw123456",
+                "full_name": "Sneaky", "role": "manager"})
+            assert r.status_code == 400
+
+            # New customer: pending, cannot log in
+            r = await client.post("/auth/register", json={
+                "username": "newcust", "email": "nc@x.com", "password": "pw123456",
+                "full_name": "New Customer", "role": "customer"})
+            assert r.status_code == 201 and r.json()["status"] == "pending"
+            cust_id = r.json()["id"]
+            r = await client.post("/auth/login", json={"username": "newcust", "password": "pw123456"})
+            assert r.status_code == 403
+
+            # New officer: pending
+            r = await client.post("/auth/register", json={
+                "username": "newoff", "email": "no@x.com", "password": "pw123456",
+                "full_name": "New Officer", "role": "employee"})
+            assert r.status_code == 201
+            off_id = r.json()["id"]
+
+            # Officer sees only customers, and cannot approve another officer
+            r = await client.get("/auth/pending", cookies=emp)
+            assert [u["id"] for u in r.json()] == [cust_id]
+            r = await client.post(f"/auth/users/{off_id}/approve", cookies=emp)
+            assert r.status_code == 403
+
+            # Officer approves the customer, who can then log in
+            r = await client.post(f"/auth/users/{cust_id}/approve", cookies=emp)
+            assert r.status_code == 200 and r.json()["status"] == "active"
+            r = await client.post("/auth/login", json={"username": "newcust", "password": "pw123456"})
+            assert r.status_code == 200
+
+            # Manager approves the officer
+            r = await client.post(f"/auth/users/{off_id}/approve", cookies=mgr)
+            assert r.status_code == 200
+            r = await client.post("/auth/login", json={"username": "newoff", "password": "pw123456"})
+            assert r.status_code == 200
+
+    run_async_test(_run)

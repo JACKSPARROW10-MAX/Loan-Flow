@@ -63,6 +63,7 @@ class UserResponse(BaseModel):
     email: str
     full_name: str
     role: str
+    status: str = "active"
     created_at: datetime
 
     class Config:
@@ -89,6 +90,14 @@ app.add_middleware(SlowAPIMiddleware)
 @app.on_event("startup")
 async def startup():
     await init_db()
+    # create_all does not alter existing tables: add the approval-status column if missing
+    from shared.database import engine
+    if "postgres" in str(engine.url):
+        from sqlalchemy import text
+        async with engine.begin() as conn:
+            await conn.execute(text(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'active'"
+            ))
     # Seed default users if none exist
     from shared.database import AsyncSessionLocal
     async with AsyncSessionLocal() as session:
@@ -145,15 +154,18 @@ async def register(request: Request, body: RegisterRequest, db: AsyncSession = D
     if existing.scalars().first():
         raise HTTPException(status_code=409, detail="Username or email already exists")
 
-    if body.role not in {ROLE_CUSTOMER, ROLE_EMPLOYEE, ROLE_MANAGER}:
-        raise HTTPException(status_code=400, detail=f"Invalid role: {body.role}")
+    # Self-registration is only for customers and loan officers; managers are provisioned internally.
+    if body.role not in {ROLE_CUSTOMER, ROLE_EMPLOYEE}:
+        raise HTTPException(status_code=400, detail="Only customer or officer accounts can be registered")
 
+    # New accounts cannot log in until approved (customers by an officer, officers by a manager).
     user = UserModel(
         username=body.username,
         email=body.email,
         full_name=body.full_name,
         hashed_password=pwd_context.hash(body.password),
         role=body.role,
+        status="pending",
     )
     db.add(user)
     await db.flush()
@@ -171,6 +183,10 @@ async def login(request: Request, body: LoginRequest, response: Response, db: As
     user = result.scalars().first()
     if not user or not pwd_context.verify(body.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
+    if user.status == "pending":
+        raise HTTPException(status_code=403, detail="Your account is awaiting approval")
+    if user.status == "rejected":
+        raise HTTPException(status_code=403, detail="Your registration was rejected")
 
     token = create_access_token(user_id=user.id, role=user.role, username=user.username)
     csrf_token = set_auth_cookies(response, token)
@@ -217,6 +233,60 @@ async def list_users(
     """List all users (manager/employee only)."""
     result = await db.execute(select(UserModel))
     return result.scalars().all()
+
+
+def _can_review(reviewer_role: str, target_role: str) -> bool:
+    """Officers approve customers; managers approve officers (and customers)."""
+    if reviewer_role == ROLE_MANAGER:
+        return target_role in {ROLE_CUSTOMER, ROLE_EMPLOYEE}
+    if reviewer_role == ROLE_EMPLOYEE:
+        return target_role == ROLE_CUSTOMER
+    return False
+
+
+@app.get("/auth/pending", response_model=list[UserResponse])
+async def list_pending(
+    user: dict = Depends(require_role(ROLE_MANAGER, ROLE_EMPLOYEE)),
+    db: AsyncSession = Depends(get_db),
+):
+    """Registrations waiting for the caller to review."""
+    result = await db.execute(
+        select(UserModel).where(UserModel.status == "pending").order_by(UserModel.created_at)
+    )
+    return [u for u in result.scalars().all() if _can_review(user["role"], u.role)]
+
+
+async def _review(user_id: str, reviewer: dict, db: AsyncSession, new_status: str):
+    result = await db.execute(select(UserModel).where(UserModel.id == user_id))
+    target = result.scalars().first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if not _can_review(reviewer["role"], target.role):
+        raise HTTPException(status_code=403, detail="You are not allowed to review this account")
+    if target.status != "pending":
+        raise HTTPException(status_code=409, detail=f"Account is already {target.status}")
+    target.status = new_status
+    await db.flush()
+    await db.refresh(target)
+    return target
+
+
+@app.post("/auth/users/{user_id}/approve", response_model=UserResponse)
+async def approve_user(
+    user_id: str,
+    user: dict = Depends(require_role(ROLE_MANAGER, ROLE_EMPLOYEE)),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _review(user_id, user, db, "active")
+
+
+@app.post("/auth/users/{user_id}/reject", response_model=UserResponse)
+async def reject_user(
+    user_id: str,
+    user: dict = Depends(require_role(ROLE_MANAGER, ROLE_EMPLOYEE)),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _review(user_id, user, db, "rejected")
 
 
 @app.get("/health")

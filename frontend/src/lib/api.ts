@@ -8,41 +8,91 @@ import { ApplicationItem, DocumentItem, LoanAccountItem, CollectionCaseItem, Aud
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:8000';
 
 let authToken: string | null = null;
-let currentRoleUser: Role = 'customer';
 
-// Default role credentials for rapid UI role switching
-const ROLE_CREDENTIALS: Record<Role, { username: string; pass: string }> = {
-  customer: { username: 'customer1', pass: 'cust123' },
-  employee: { username: 'employee1', pass: 'emp123' },
-  manager: { username: 'manager1', pass: 'mgr123' },
-};
+export interface SessionUser {
+  id: string;
+  username: string;
+  full_name: string;
+  role: Role;
+}
 
-/**
- * Log in to the backend for the designated role.
- */
-export async function switchRoleAuth(role: Role): Promise<string> {
-  currentRoleUser = role;
-  const creds = ROLE_CREDENTIALS[role];
+export interface PendingUser {
+  id: string;
+  username: string;
+  email: string;
+  full_name: string;
+  role: Role;
+  status: string;
+  created_at: string;
+}
+
+const SESSION_KEY = 'loanflow_session';
+
+/** Restore a previously saved login (token + user) from this browser. */
+export function loadSession(): SessionUser | null {
+  if (typeof window === 'undefined') return null;
   try {
-    const res = await fetch(`${API_BASE}/auth/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',
-      body: JSON.stringify({ username: creds.username, password: creds.pass }),
-    });
-
-    if (res.ok) {
-      const data = await res.json();
-      authToken = data.token || data.access_token || null;
-      if (typeof window !== 'undefined' && authToken) {
-        localStorage.setItem(`loanflow_token_${role}`, authToken);
-      }
-      return authToken || '';
-    }
-  } catch (err) {
-    console.warn(`[LoanFlow API] Automatic login for ${role} failed:`, err);
+    const raw = localStorage.getItem(SESSION_KEY);
+    if (!raw) return null;
+    const { token, user } = JSON.parse(raw);
+    if (!token || !user) return null;
+    authToken = token;
+    return user as SessionUser;
+  } catch {
+    return null;
   }
-  return '';
+}
+
+/** Log in with real credentials. Throws with the server's message on failure. */
+export async function login(username: string, password: string): Promise<SessionUser> {
+  const res = await fetch(`${API_BASE}/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({ username, password }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(typeof data.detail === 'string' ? data.detail : 'Login failed');
+  }
+  authToken = data.token || data.access_token;
+  const user: SessionUser = data.user;
+  try {
+    localStorage.setItem(SESSION_KEY, JSON.stringify({ token: authToken, user }));
+  } catch {}
+  return user;
+}
+
+export async function logout(): Promise<void> {
+  authToken = null;
+  try {
+    localStorage.removeItem(SESSION_KEY);
+  } catch {}
+  try {
+    await fetch(`${API_BASE}/auth/logout`, { method: 'POST', credentials: 'include' });
+  } catch {}
+}
+
+/** Register a new account. It stays pending until an officer/manager approves it. */
+export async function registerUser(data: {
+  username: string;
+  email: string;
+  password: string;
+  full_name: string;
+  role: 'customer' | 'employee';
+}): Promise<void> {
+  const res = await fetch(`${API_BASE}/auth/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    const detail = body.detail;
+    throw new Error(
+      typeof detail === 'string' ? detail : Array.isArray(detail) ? 'Please check the entered details' : 'Registration failed'
+    );
+  }
 }
 
 /**
@@ -50,24 +100,15 @@ export async function switchRoleAuth(role: Role): Promise<string> {
  */
 async function apiFetch<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers || {});
-  
+
   if (!headers.has('Content-Type') && !(options.body instanceof FormData)) {
     headers.set('Content-Type', 'application/json');
   }
 
-  // Get current token
-  if (!authToken && typeof window !== 'undefined') {
-    authToken = localStorage.getItem(`loanflow_token_${currentRoleUser}`);
-  }
-
-  // If still no token, perform transparent login
   if (!authToken) {
-    authToken = await switchRoleAuth(currentRoleUser);
+    throw new Error('Not signed in');
   }
-
-  if (authToken) {
-    headers.set('Authorization', `Bearer ${authToken}`);
-  }
+  headers.set('Authorization', `Bearer ${authToken}`);
 
   const res = await fetch(`${API_BASE}${endpoint}`, {
     ...options,
@@ -88,6 +129,16 @@ async function apiFetch<T>(endpoint: string, options: RequestInit = {}): Promise
   }
 
   return res.json() as Promise<T>;
+}
+
+// ═══════════════════════ Account approvals ═══════════════════════
+
+export async function fetchPendingUsers(): Promise<PendingUser[]> {
+  return apiFetch<PendingUser[]>('/auth/pending');
+}
+
+export async function reviewUser(userId: string, action: 'approve' | 'reject'): Promise<PendingUser> {
+  return apiFetch<PendingUser>(`/auth/users/${userId}/${action}`, { method: 'POST' });
 }
 
 // ═══════════════════════ Applications ═══════════════════════

@@ -6,6 +6,8 @@ import { CustomerPortal } from '@/components/CustomerPortal';
 import { UnderwriterWorkbench } from '@/components/UnderwriterWorkbench';
 import { ManagerApprovalDesk } from '@/components/ManagerApprovalDesk';
 import { AnalyticsDashboard } from '@/components/AnalyticsDashboard';
+import { LoginPage } from '@/components/LoginPage';
+import { PendingApprovals } from '@/components/PendingApprovals';
 import {
   Role,
   ApplicationItem,
@@ -29,7 +31,9 @@ import {
   payEmi as apiPayEmi,
   fetchCollectionCases,
   addCollectionFollowUp,
-  switchRoleAuth,
+  loadSession,
+  logout as apiLogout,
+  SessionUser,
   fetchAuditLogs,
 } from '@/lib/api';
 import {
@@ -40,7 +44,9 @@ import {
 } from '@/lib/mockData';
 
 export default function Home() {
-  const [currentRole, setCurrentRole] = useState<Role>('customer');
+  const [user, setUser] = useState<SessionUser | null>(null);
+  const [sessionChecked, setSessionChecked] = useState<boolean>(false);
+  const currentRole: Role = user?.role ?? 'customer';
   const [activeTab, setActiveTab] = useState<'portal' | 'analytics'>('portal');
 
   // Core state
@@ -56,9 +62,6 @@ export default function Home() {
   const syncWithBackend = useCallback(async (role: Role) => {
     setIsLoading(true);
     try {
-      // 1. Authenticate with backend for current role
-      await switchRoleAuth(role);
-
       // 2. Fetch live applications from PostgreSQL
       const liveApps = await fetchApplications();
       setApplications(liveApps);
@@ -71,13 +74,24 @@ export default function Home() {
         setLoanAccount(undefined);
       }
 
-      // 4. Fetch collection cases
-      const cases = await fetchCollectionCases();
-      setCollectionCases(cases || []);
+      // 4. Fetch collection cases (officers and managers only)
+      if (role !== 'customer') {
+        const cases = await fetchCollectionCases();
+        setCollectionCases(cases || []);
+      } else {
+        setCollectionCases([]);
+      }
 
       setIsLiveConnected(true);
       setStatusMessage('Connected to live backend (PostgreSQL + Gateway)');
     } catch (err: any) {
+      if (/not authenticated|expired|invalid token|not signed in/i.test(err?.message || '')) {
+        // Session is no longer valid: return to the login page
+        await apiLogout();
+        setUser(null);
+        setIsLoading(false);
+        return;
+      }
       console.warn('[LoanFlow UI] Backend connection failed, using fallback data:', err);
       setIsLiveConnected(false);
       setStatusMessage(`API offline or starting up: ${err.message}`);
@@ -91,16 +105,34 @@ export default function Home() {
     }
   }, []);
 
-  // Handle role switch
-  const handleRoleChange = async (newRole: Role) => {
-    setCurrentRole(newRole);
-    await syncWithBackend(newRole);
+  // Restore a saved session on first load
+  useEffect(() => {
+    const saved = loadSession();
+    if (saved) {
+      setUser(saved);
+      syncWithBackend(saved.role);
+    } else {
+      setIsLoading(false);
+    }
+    setSessionChecked(true);
+  }, [syncWithBackend]);
+
+  const handleLoggedIn = async (loggedIn: SessionUser) => {
+    setUser(loggedIn);
+    setActiveTab('portal');
+    setApplications([]);
+    await syncWithBackend(loggedIn.role);
   };
 
-  // Initial load
-  useEffect(() => {
-    syncWithBackend('customer');
-  }, [syncWithBackend]);
+  const handleLogout = async () => {
+    await apiLogout();
+    setUser(null);
+    setApplications([]);
+    setLoanAccount(undefined);
+    setCollectionCases([]);
+    setAuditLogs([]);
+    setActiveTab('portal');
+  };
 
   // Record audit log helper
   const logAudit = (
@@ -111,11 +143,7 @@ export default function Home() {
     old_value?: string,
     details?: Record<string, any>
   ) => {
-    const roleNames: Record<Role, string> = {
-      customer: 'cust-101 (Amit Sharma)',
-      employee: 'emp-201 (Rahul Verma)',
-      manager: 'mgr-301 (Priya Mehta)',
-    };
+    const performer = user ? `${user.username} (${user.full_name})` : 'unknown';
 
     const newLog: AuditLogItem = {
       id: `aud-${Date.now()}`,
@@ -124,7 +152,7 @@ export default function Home() {
       action,
       new_value,
       old_value,
-      performed_by: roleNames[currentRole],
+      performed_by: performer,
       performed_by_role: currentRole,
       details,
       created_at: new Date().toISOString(),
@@ -143,7 +171,7 @@ export default function Home() {
         employment_type: data.employment_type || 'Salaried',
         employer_name: data.employer_name || 'Tata Consultancy Services',
         loan_tenure_months: Number(data.loan_tenure_months) || 120,
-        customer_name: data.customer_name || 'Amit Sharma',
+        customer_name: data.customer_name || user?.full_name || 'Customer',
       };
 
       const created = await apiCreateApplication(payload);
@@ -606,11 +634,19 @@ export default function Home() {
     logAudit('collection_case', caseId, 'follow_up_recorded', note);
   };
 
+  if (!sessionChecked) {
+    return <div className="min-h-screen bg-[#F7F8F5]" />;
+  }
+  if (!user) {
+    return <LoginPage onLoggedIn={handleLoggedIn} />;
+  }
+
   return (
     <div className="min-h-screen bg-[#F7F8F5] flex flex-col font-sans">
       <Navbar
         currentRole={currentRole}
-        onRoleChange={handleRoleChange}
+        userName={user.full_name}
+        onLogout={handleLogout}
         activeTab={activeTab}
         onTabChange={setActiveTab}
       />
@@ -633,12 +669,13 @@ export default function Home() {
       </div>
 
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        {currentRole !== 'customer' && activeTab === 'portal' && <PendingApprovals />}
         {isLoading && applications.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-20">
             <div className="w-8 h-8 border-4 border-[#0C3B2E] border-t-transparent rounded-full animate-spin mb-4" />
             <p className="text-sm text-[#0C3B2E] font-medium">Syncing with LoanFlow backend...</p>
           </div>
-        ) : activeTab === 'analytics' ? (
+        ) : activeTab === 'analytics' && currentRole !== 'customer' ? (
           <AnalyticsDashboard
             applications={applications}
             auditLogs={auditLogs}

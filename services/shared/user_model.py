@@ -22,6 +22,8 @@ class UserModel(Base):
     hashed_password = Column(String(255), nullable=False)
     full_name = Column(String(255), nullable=False)
     role = Column(String(50), nullable=False, default=ROLE_CUSTOMER)
+    # active | pending (awaiting approval) | rejected
+    status = Column(String(20), nullable=False, default="active", server_default="active")
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
                         onupdate=lambda: datetime.now(timezone.utc))
