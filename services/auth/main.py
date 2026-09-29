@@ -26,6 +26,7 @@ from shared.security import (
     ACCESS_TOKEN_COOKIE,
 )
 from shared.config import get_settings
+from shared.user_model import UserModel
 
 settings = get_settings()
 
@@ -37,18 +38,8 @@ limiter = Limiter(key_func=get_remote_address)
 
 # ═══════════════════════ ORM Model ═══════════════════════
 
-class UserModel(Base):
-    __tablename__ = "users"
-
-    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    username = Column(String(100), unique=True, nullable=False, index=True)
-    email = Column(String(255), unique=True, nullable=False)
-    hashed_password = Column(String(255), nullable=False)
-    full_name = Column(String(255), nullable=False)
-    role = Column(String(50), nullable=False, default=ROLE_CUSTOMER)
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
-    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
-                        onupdate=lambda: datetime.now(timezone.utc))
+# UserModel is defined in shared/user_model.py (imported below) so that
+# loan_app can resolve its foreign keys to `users` without the auth service.
 
 
 # ═══════════════════════ Pydantic Schemas ═══════════════════════

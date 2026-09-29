@@ -15,6 +15,7 @@ from sqlalchemy.orm import relationship
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from shared.database import Base
+from shared.user_model import UserModel  # noqa: F401  registers `users` for FKs
 
 
 # ═══════════════════════ Enums ═══════════════════════
