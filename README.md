@@ -126,7 +126,61 @@ npm run dev
 
 ## ☁️ Deployment
 
-- **Database & Storage**: [Supabase](https://supabase.com) (PostgreSQL + Supabase Storage for files).
-- **Cache**: [Upstash](https://upstash.com) (Serverless Redis).
-- **Backend Services**: Deploy via `render.yaml` blueprint to [Render](https://render.com).
-- **Frontend UI**: Deploy `frontend/` directory directly to [Vercel](https://vercel.com).
+| Layer | Provider | Notes |
+|---|---|---|
+| Frontend (Next.js) | [Vercel](https://vercel.com) | Root directory `frontend` |
+| Backend (7 FastAPI services) | [Render](https://render.com) | `render.yaml` Blueprint, free plan |
+| Database + file storage | [Supabase](https://supabase.com) | Postgres via the **Session pooler** URL, bucket `loanflow-docs` |
+| Cache | [Upstash](https://upstash.com) | Redis over TLS (`rediss://`) |
+
+Live frontend: https://loan-flow-iota.vercel.app
+
+### 1. Supabase
+1. Create a project and copy the **Session pooler** connection string (Connect -> Connection string). Direct connections are IPv6-only and do not work from Render.
+2. Storage -> create a private bucket named `loanflow-docs`.
+3. Copy the project URL and the legacy `anon` / `service_role` API keys (Project Settings -> API).
+4. No SQL to run: on startup `loan_app` creates the tables, the `trg_audit_log_immutable` trigger and the reporting views; `auth` seeds the demo users.
+
+### 2. Upstash
+Create a Redis database. Use the TCP endpoint as `rediss://default:<TOKEN>@<host>:6379` (two `s`, TLS required). The value must be the URL only, not the `redis-cli` command.
+
+### 3. Render (backend)
+1. Create an **Env Group** named `loanflow-env` inside the same Render project/environment that the Blueprint targets (`render.yaml` places services in `Loan-Flow / loanflow-env`).
+2. Add the variables below, then **New -> Blueprint** and select this repo.
+3. After the first deploy, add the six `*_SERVICE_URL` values (each service's `onrender.com` URL) and redeploy the gateway. Saving an env group does not restart services; redeploy them.
+
+| Variable | Value |
+|---|---|
+| `DATABASE_URL` | Supabase pooler URL (`postgresql://postgres.<ref>:<password>@<pooler-host>:5432/postgres`) |
+| `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` | Supabase API settings |
+| `UPSTASH_REDIS_URL`, `UPSTASH_REDIS_TOKEN` | Upstash TCP URL and token |
+| `JWT_SECRET`, `CSRF_SECRET` | Long random strings, for example `python -c "import secrets; print(secrets.token_hex(32))"` |
+| `JWT_ALGORITHM`, `JWT_EXPIRE_MINUTES` | `HS256`, `60` |
+| `STORAGE_BUCKET` | `loanflow-docs` |
+| `CORS_ORIGINS` | Comma-separated frontend origins, for example `https://loan-flow-iota.vercel.app` |
+| `AUTH_SERVICE_URL`, `LOAN_APP_SERVICE_URL`, `DOCUMENT_SERVICE_URL`, `KYC_SERVICE_URL`, `RISK_SERVICE_URL`, `AUDIT_SERVICE_URL` | Public URLs of the deployed services |
+| `NOTIFICATION_SERVICE_URL` | Optional. The notification service is not part of the Blueprint, so `/notifications`, `/notify` and `/ws` return 502 until it is deployed |
+
+Never commit real values; `.env` is git-ignored.
+
+### 4. Vercel (frontend)
+Import the repo with **Root Directory** `frontend` and set:
+
+| Variable | Value |
+|---|---|
+| `NEXT_PUBLIC_API_BASE_URL` | `/api` |
+| `BACKEND_URL` | Gateway URL, for example `https://loanflow-gateway.onrender.com` (no trailing slash) |
+
+`frontend/next.config.ts` rewrites `/api/*` to `BACKEND_URL`, so the browser only talks to the Vercel origin and the httpOnly auth cookies stay first-party. `NEXT_PUBLIC_*` values are baked in at build time; redeploy after changing them.
+
+### 5. Verify
+1. Open `<gateway-url>/health` and expect `{"status":"ok","service":"gateway"}`.
+2. Open the Vercel site and switch between Customer, Officer (Maker) and Manager (Checker).
+3. Run the flow: create an application, upload a document, run eligibility and risk, approve as a different user, disburse.
+
+### Notes
+- Free Render services sleep after about 15 minutes idle; the first request can take around a minute. Wake them before a demo.
+- Demo users are seeded by the auth service (`customer1`, `employee1`, `manager1`). Change their passwords before any real use.
+
+### CI
+`.github/workflows/ci.yml` runs the 12 PostgreSQL integration tests (Postgres 16 service container) and the Next.js typecheck/build on every push and pull request to `main`. Tests read `DATABASE_URL` from the environment and default to `127.0.0.1:5434` locally.
