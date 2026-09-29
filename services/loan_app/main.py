@@ -97,53 +97,58 @@ async def startup():
                 $$ LANGUAGE plpgsql;
             """)
         )
-        await conn.execute(
-            __import__("sqlalchemy").text("""
-                DO $$
-                BEGIN
-                    IF NOT EXISTS (
-                        SELECT 1 FROM pg_trigger WHERE tgname = 'trg_audit_log_immutable'
-                    ) THEN
-                        CREATE TRIGGER trg_audit_log_immutable
-                        BEFORE UPDATE OR DELETE ON audit_log
-                        FOR EACH ROW
-                        EXECUTE FUNCTION prevent_audit_log_modification();
-                    END IF;
-                END $$;
-            """)
-        )
+            await conn.execute(
+                __import__("sqlalchemy").text("""
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1 FROM pg_trigger WHERE tgname = 'trg_audit_log_immutable'
+                        ) THEN
+                            CREATE TRIGGER trg_audit_log_immutable
+                            BEFORE UPDATE OR DELETE ON audit_log
+                            FOR EACH ROW
+                            EXECUTE FUNCTION prevent_audit_log_modification();
+                        END IF;
+                    END $$;
+                """)
+            )
 
-        # Create Analytical SQL Views for Power BI Reporting
-        await conn.execute(
-            __import__("sqlalchemy").text("""
-                CREATE OR REPLACE VIEW vw_approval_rate AS
-                SELECT 
-                    COUNT(*) AS total_applications,
-                    SUM(CASE WHEN stage = 'Approved' THEN 1 ELSE 0 END) AS approved_count,
-                    SUM(CASE WHEN stage = 'Returned' THEN 1 ELSE 0 END) AS returned_count,
-                    SUM(CASE WHEN stage = 'Rejected' THEN 1 ELSE 0 END) AS rejected_count,
-                    ROUND(CAST(SUM(CASE WHEN stage = 'Approved' THEN 1 ELSE 0 END) AS numeric) * 100.0 / NULLIF(COUNT(*), 0), 2) AS approval_rate_pct
-                FROM applications;
+        # Analytical SQL views for Power BI reporting (best-effort, one statement each:
+        # asyncpg does not allow several commands in a single execute)
+        _views_sql = """
+CREATE OR REPLACE VIEW vw_approval_rate AS
+                    SELECT 
+                        COUNT(*) AS total_applications,
+                        SUM(CASE WHEN stage = 'Approved' THEN 1 ELSE 0 END) AS approved_count,
+                        SUM(CASE WHEN stage = 'Returned' THEN 1 ELSE 0 END) AS returned_count,
+                        SUM(CASE WHEN stage = 'Rejected' THEN 1 ELSE 0 END) AS rejected_count,
+                        ROUND(CAST(SUM(CASE WHEN stage = 'Approved' THEN 1 ELSE 0 END) AS numeric) * 100.0 / NULLIF(COUNT(*), 0), 2) AS approval_rate_pct
+                    FROM applications;
 
-                CREATE OR REPLACE VIEW vw_overdue_trend AS
-                SELECT 
-                    bucket,
-                    COUNT(*) AS case_count,
-                    SUM(overdue_amount) AS total_overdue_amount,
-                    ROUND(CAST(AVG(dpd) AS numeric), 1) AS avg_dpd
-                FROM collection_cases
-                GROUP BY bucket;
+                    CREATE OR REPLACE VIEW vw_overdue_trend AS
+                    SELECT 
+                        bucket,
+                        COUNT(*) AS case_count,
+                        SUM(overdue_amount) AS total_overdue_amount,
+                        ROUND(CAST(AVG(dpd) AS numeric), 1) AS avg_dpd
+                    FROM collection_cases
+                    GROUP BY bucket;
 
-                CREATE OR REPLACE VIEW vw_risk_mix AS
-                SELECT 
-                    COALESCE(risk_band, 'Unrated') AS risk_band,
-                    COUNT(*) AS total_count,
-                    ROUND(CAST(AVG(requested_amount) AS numeric), 2) AS avg_requested_amount,
-                    ROUND(CAST(AVG(risk_score) AS numeric), 2) AS avg_risk_score
-                FROM applications
-                GROUP BY risk_band;
-            """)
-        )
+                    CREATE OR REPLACE VIEW vw_risk_mix AS
+                    SELECT 
+                        COALESCE(risk_band, 'Unrated') AS risk_band,
+                        COUNT(*) AS total_count,
+                        ROUND(CAST(AVG(requested_amount) AS numeric), 2) AS avg_requested_amount,
+                        ROUND(CAST(AVG(risk_score) AS numeric), 2) AS avg_risk_score
+                    FROM applications
+                    GROUP BY risk_band;
+        """
+        for _stmt in [s.strip() for s in _views_sql.split(";") if s.strip()]:
+            try:
+                async with engine.begin() as vconn:
+                    await vconn.execute(__import__("sqlalchemy").text(_stmt))
+            except Exception as exc:  # views are optional; do not block startup
+                print(f"[startup] view creation skipped: {exc}")
 
     # Seed policy rules
     async with AsyncSessionLocal() as session:
