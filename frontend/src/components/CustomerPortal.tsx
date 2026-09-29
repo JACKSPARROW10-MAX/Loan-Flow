@@ -22,6 +22,7 @@ import {
 interface CustomerPortalProps {
   applications: ApplicationItem[];
   loanAccount?: LoanAccountItem;
+  customerName: string;
   onNewApplication: (data: Partial<ApplicationItem>) => void;
   onUploadDocument: (appId: string, docType: string, fileName: string, fileHash: string, file?: File) => boolean | Promise<boolean>;
   onPayEmi: (accountId: string, amount: number) => void;
@@ -30,6 +31,7 @@ interface CustomerPortalProps {
 export const CustomerPortal: React.FC<CustomerPortalProps> = ({
   applications,
   loanAccount,
+  customerName,
   onNewApplication,
   onUploadDocument,
   onPayEmi,
@@ -107,7 +109,7 @@ export const CustomerPortal: React.FC<CustomerPortalProps> = ({
       existing_emi: Number(existingEmi),
       employer_name: employer,
       employment_type: employmentType,
-      customer_name: 'Amit Sharma',
+      customer_name: customerName,
     });
     setIsApplyModalOpen(false);
   };
@@ -124,7 +126,7 @@ export const CustomerPortal: React.FC<CustomerPortalProps> = ({
               <ShieldCheck className="w-3.5 h-3.5" />
               <span>KYC Verified Borrower</span>
             </div>
-            <h1 className="text-2xl sm:text-3xl font-bold tracking-tight">Welcome, Amit Sharma</h1>
+            <h1 className="text-2xl sm:text-3xl font-bold tracking-tight">Welcome, {customerName}</h1>
             <p className="text-sm text-[#8eb494] mt-1 max-w-xl">
               Track live approval stages, view explainable rule decisions, and manage your active loan repayments seamlessly.
             </p>

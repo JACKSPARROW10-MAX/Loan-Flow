@@ -2,14 +2,14 @@
 
 import React from 'react';
 import { Role } from '@/types';
-import { ShieldCheck, UserCheck, Briefcase, BarChart3, Landmark, LogOut } from 'lucide-react';
+import { ShieldCheck, UserCheck, Briefcase, BarChart3, Landmark, LogOut, Scale } from 'lucide-react';
 
 interface NavbarProps {
   currentRole: Role;
   userName: string;
   onLogout: () => void;
-  activeTab: 'portal' | 'analytics';
-  onTabChange: (tab: 'portal' | 'analytics') => void;
+  activeTab: 'portal' | 'analytics' | 'rules';
+  onTabChange: (tab: 'portal' | 'analytics' | 'rules') => void;
 }
 
 const roleConfig = {
@@ -58,6 +58,19 @@ export const Navbar: React.FC<NavbarProps> = ({ currentRole, userName, onLogout,
                 <BarChart3 className="w-3.5 h-3.5" />
                 <span>Risk & Audit Analytics</span>
               </button>
+              {currentRole === 'manager' && (
+                <button
+                  onClick={() => onTabChange('rules')}
+                  className={`flex items-center space-x-1.5 px-3.5 py-1.5 rounded-lg text-xs font-medium transition-all ${
+                    activeTab === 'rules'
+                      ? 'bg-[#6D9773] text-white shadow-sm'
+                      : 'text-[#8eb494] hover:text-white hover:bg-[#0C3B2E]'
+                  }`}
+                >
+                  <Scale className="w-3.5 h-3.5" />
+                  <span>Rules & Regulations</span>
+                </button>
+              )}
             </nav>
           )}
 

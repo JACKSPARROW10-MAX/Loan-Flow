@@ -24,7 +24,11 @@ export interface DocumentItem {
   file_name: string;
   file_hash: string;
   file_size: number;
+  mime_type?: string;
   status: DocumentStatus;
+  fraud_score?: number | null;
+  fraud_flag?: 'CLEAN' | 'SUSPICIOUS' | 'HIGH_RISK' | null;
+  fraud_findings?: string[] | null;
   malware_scanned: boolean;
   verified_by?: string;
   verified_at?: string;
@@ -174,4 +178,39 @@ export interface AnalyticsSummary {
     par_60: number;
     par_90_npa: number;
   };
+}
+
+// ═══════════════════════ Rules & Regulations ═══════════════════════
+
+export interface RuleParamSpec {
+  name: string;
+  label: string;
+  type: 'number' | 'integer' | 'text' | 'list' | 'boolean';
+  default: any;
+}
+
+export interface RuleTypeSpec {
+  label: string;
+  category: 'eligibility' | 'limit' | 'risk' | 'fraud';
+  description: string;
+  params: RuleParamSpec[];
+}
+
+export interface RuleCatalog {
+  all_products: string;
+  types: Record<string, RuleTypeSpec>;
+}
+
+export interface RuleItem {
+  id: string;
+  loan_type: string;
+  rule_name: string;
+  rule_config: Record<string, any> & { type: string; description?: string };
+  category: string | null;
+  is_active: boolean;
+  is_mandatory: boolean;
+  created_by?: string | null;
+  updated_by?: string | null;
+  created_at?: string;
+  updated_at?: string;
 }

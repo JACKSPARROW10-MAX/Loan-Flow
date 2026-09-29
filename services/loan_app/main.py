@@ -13,6 +13,7 @@ from typing import Optional
 from fastapi import FastAPI, Depends, HTTPException, Request, UploadFile, File, Form, Query, status, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select, func, delete
+from sqlalchemy.orm import undefer
 from sqlalchemy.ext.asyncio import AsyncSession
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -31,6 +32,8 @@ from shared.config import get_settings
 from shared.redis_client import get_redis
 from shared.event_bus import Event, create_event_bus
 from .report_pdf import generate_assessment_report_pdf
+from . import rules_engine
+from .doc_fraud import analyze_document
 
 from .models import (
     Application, Document, RuleResult, PolicyRule, AuditLog, EventLog,
@@ -45,7 +48,7 @@ from .schemas import (
     DisbursementRequest, LoanAccountResponse, EMIScheduleItem,
     PaymentRequest, PaymentResponse, CollectionCaseResponse,
     CollectionFollowUpRequest, AssessmentReportResponse, AnalyticsSummaryResponse,
-    FraudAlertResponse, FraudCheckRequest,
+    FraudAlertResponse, FraudCheckRequest, RuleWrite, RuleActiveRequest,
 )
 
 settings = get_settings()
@@ -83,6 +86,21 @@ def next_app_number() -> str:
 async def startup():
     await init_db()
 
+    # create_all does not alter existing tables: add columns introduced after first deploy
+    if "postgres" in str(engine.url):
+        async with engine.begin() as conn:
+            for stmt in (
+                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS fraud_score DOUBLE PRECISION",
+                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS fraud_flag VARCHAR(20)",
+                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS fraud_findings JSON",
+                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS file_content BYTEA",
+                "ALTER TABLE policy_rules ADD COLUMN IF NOT EXISTS is_mandatory BOOLEAN DEFAULT TRUE",
+                "ALTER TABLE policy_rules ADD COLUMN IF NOT EXISTS created_by VARCHAR",
+                "ALTER TABLE policy_rules ADD COLUMN IF NOT EXISTS updated_by VARCHAR",
+                "ALTER TABLE policy_rules ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now()",
+            ):
+                await conn.execute(__import__("sqlalchemy").text(stmt))
+
     # Create append-only trigger for audit_log (PostgreSQL)
     if "postgres" in str(engine.url):
         async with engine.begin() as conn:
@@ -119,10 +137,10 @@ async def startup():
 CREATE OR REPLACE VIEW vw_approval_rate AS
                     SELECT 
                         COUNT(*) AS total_applications,
-                        SUM(CASE WHEN stage = 'Approved' THEN 1 ELSE 0 END) AS approved_count,
-                        SUM(CASE WHEN stage = 'Returned' THEN 1 ELSE 0 END) AS returned_count,
-                        SUM(CASE WHEN stage = 'Rejected' THEN 1 ELSE 0 END) AS rejected_count,
-                        ROUND(CAST(SUM(CASE WHEN stage = 'Approved' THEN 1 ELSE 0 END) AS numeric) * 100.0 / NULLIF(COUNT(*), 0), 2) AS approval_rate_pct
+                        SUM(CASE WHEN stage = 'APPROVED' THEN 1 ELSE 0 END) AS approved_count,
+                        SUM(CASE WHEN stage = 'RETURNED' THEN 1 ELSE 0 END) AS returned_count,
+                        SUM(CASE WHEN stage = 'REJECTED' THEN 1 ELSE 0 END) AS rejected_count,
+                        ROUND(CAST(SUM(CASE WHEN stage = 'APPROVED' THEN 1 ELSE 0 END) AS numeric) * 100.0 / NULLIF(COUNT(*), 0), 2) AS approval_rate_pct
                     FROM applications;
 
                     CREATE OR REPLACE VIEW vw_overdue_trend AS
@@ -150,41 +168,28 @@ CREATE OR REPLACE VIEW vw_approval_rate AS
             except Exception as exc:  # views are optional; do not block startup
                 print(f"[startup] view creation skipped: {exc}")
 
-    # Seed policy rules
+    # Managers own the rules; insert the starter set only where a rule is missing
     async with AsyncSessionLocal() as session:
-        result = await session.execute(select(PolicyRule).limit(1))
-        if result.scalars().first() is None:
-            seed_rules = [
-                # Home Loan rules
-                PolicyRule(rule_name="min_income", loan_type="Home Loan",
-                           rule_config={"type": "min_income", "min": 300000,
-                                        "description": "Minimum annual income ₹3,00,000"}),
-                PolicyRule(rule_name="min_age", loan_type="Home Loan",
-                           rule_config={"type": "min_age", "min": 21,
-                                        "description": "Applicant must be at least 21 years old"}),
-                PolicyRule(rule_name="max_emi_ratio", loan_type="Home Loan",
-                           rule_config={"type": "max_emi_ratio", "max_ratio": 0.5,
-                                        "description": "Total EMIs must not exceed 50% of monthly income"}),
-                PolicyRule(rule_name="employment_required", loan_type="Home Loan",
-                           rule_config={"type": "employment_check",
-                                        "description": "Must be Salaried or Self-Employed"}),
-                PolicyRule(rule_name="max_amount", loan_type="Home Loan",
-                           rule_config={"type": "max_amount", "max": 10000000,
-                                        "description": "Maximum loan amount ₹1,00,00,000"}),
-                # Personal Loan rules
-                PolicyRule(rule_name="min_income", loan_type="Personal Loan",
-                           rule_config={"type": "min_income", "min": 200000,
-                                        "description": "Minimum annual income ₹2,00,000"}),
-                PolicyRule(rule_name="max_amount", loan_type="Personal Loan",
-                           rule_config={"type": "max_amount", "max": 2000000,
-                                        "description": "Maximum loan amount ₹20,00,000"}),
-                PolicyRule(rule_name="max_emi_ratio", loan_type="Personal Loan",
-                           rule_config={"type": "max_emi_ratio", "max_ratio": 0.4,
-                                        "description": "Total EMIs must not exceed 40% of monthly income"}),
-            ]
-            session.add_all(seed_rules)
-            await session.commit()
+        existing = await session.execute(select(PolicyRule.loan_type, PolicyRule.rule_name))
+        have = {(lt, rn) for lt, rn in existing.all()}
+        for d in rules_engine.default_rules():
+            if (d["loan_type"], d["rule_name"]) not in have:
+                session.add(PolicyRule(
+                    loan_type=d["loan_type"], rule_name=d["rule_name"],
+                    rule_config=d["rule_config"], is_mandatory=d["is_mandatory"],
+                    is_active=True, created_by="system",
+                ))
+        # Rules saved before a parameter existed are completed with the catalog defaults
+        for rule in (await session.execute(select(PolicyRule))).scalars().all():
+            try:
+                fixed = rules_engine.validate_config(rule.rule_config)
+            except rules_engine.RuleConfigError:
+                continue
+            if fixed != rule.rule_config:
+                rule.rule_config = fixed
+        await session.commit()
 
+    async with AsyncSessionLocal() as session:
         # Seed sample applications
         result = await session.execute(select(Application).limit(1))
         if result.scalars().first() is None:
@@ -238,6 +243,40 @@ async def write_audit(
         details=details,
     )
     db.add(entry)
+
+
+# ═══════════════════════ Rule helpers ═══════════════════════
+
+async def load_active_rules(db: AsyncSession, loan_type: str, category: Optional[str] = None) -> list[PolicyRule]:
+    """Active rules for a product (plus rules that apply to every product), optionally by category."""
+    res = await db.execute(
+        select(PolicyRule).where(
+            PolicyRule.is_active == True,  # noqa: E712
+            PolicyRule.loan_type.in_([loan_type, rules_engine.ALL_PRODUCTS]),
+        )
+    )
+    rules = res.scalars().all()
+    if category:
+        rules = [r for r in rules if rules_engine.rule_category(r.rule_config) == category]
+    return rules
+
+
+async def find_rule(db: AsyncSession, loan_type: str, rule_type: str) -> Optional[PolicyRule]:
+    """Most specific active rule of a type: product-level first, then the all-products rule."""
+    rules = [r for r in await load_active_rules(db, loan_type) if r.rule_config.get("type") == rule_type]
+    rules.sort(key=lambda r: 0 if r.loan_type == loan_type else 1)
+    return rules[0] if rules else None
+
+
+async def evaluate_eligibility_rules(db: AsyncSession, application: Application):
+    """Run every active eligibility rule. Returns a list of (rule, passed, reason)."""
+    docs_res = await db.execute(select(Document).where(Document.application_id == application.id))
+    docs = docs_res.scalars().all()
+    out = []
+    for rule in await load_active_rules(db, application.loan_type, "eligibility"):
+        passed, reason = rules_engine.evaluate_rule(rule.rule_config, application, docs)
+        out.append((rule, passed, reason))
+    return out
 
 
 # ═══════════════════════ APPLICATION ENDPOINTS ═══════════════════════
@@ -377,6 +416,17 @@ async def transition_stage(
             )
         application.approved_by = user["sub"]
 
+        # Dynamic policy gate: mandatory rules configured by managers must pass
+        if target == ApplicationStage.APPROVED:
+            evaluated = await evaluate_eligibility_rules(db, application)
+            blocking = [(r, why) for r, ok, why in evaluated if not ok and r.is_mandatory]
+            if blocking:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Cannot approve: mandatory rule(s) not met: "
+                           + "; ".join(f"{r.rule_name} ({why})" for r, why in blocking),
+                )
+
     # Validate transition is allowed
     allowed = VALID_TRANSITIONS.get(current, [])
     if target not in allowed:
@@ -502,14 +552,25 @@ async def upload_document(
             f"Duplicate document detected. A file with the same content (hash: {file_hash[:12]}...) already exists.",
         )
 
-    # Store file via Supabase Storage
+    # Fraud analysis of the file content (advisory; shown to the officer)
+    dup_res = await db.execute(
+        select(func.count()).select_from(Document).where(
+            Document.file_hash == file_hash, Document.application_id != app_id
+        )
+    )
+    analysis = analyze_document(
+        file_data, file.filename or "", file.content_type or "", duplicate_count=dup_res.scalar() or 0
+    )
+
+    # Store file via Supabase Storage; keep a database copy when storage is unavailable
     storage_path = f"applications/{app_id}/{file_hash}_{file.filename}"
+    stored_remotely = False
     try:
         from shared.storage import upload_file as store_upload
         store_upload(settings.storage_bucket, storage_path, file_data, file.content_type or "application/octet-stream")
-    except Exception as e:
-        # If storage fails, still save metadata (storage path for later retry)
-        pass
+        stored_remotely = True
+    except Exception:
+        stored_remotely = False
 
     doc = Document(
         application_id=app_id,
@@ -522,6 +583,10 @@ async def upload_document(
         status=DocumentStatus.PENDING,
         malware_scanned=True,  # Stub: always passes
         malware_scan_status="CLEAN",
+        fraud_score=analysis["score"],
+        fraud_flag=analysis["flag"],
+        fraud_findings=analysis["findings"],
+        file_content=None if stored_remotely else file_data,
     )
     db.add(doc)
     await db.flush()
@@ -529,7 +594,8 @@ async def upload_document(
 
     await write_audit(db, "document", doc.id, "uploaded",
                       user["sub"], user.get("role", ""),
-                      new_value=f"{document_type}: {file.filename}")
+                      new_value=f"{document_type}: {file.filename}",
+                      details={"fraud_flag": analysis["flag"], "fraud_score": analysis["score"]})
 
     return doc
 
@@ -540,11 +606,47 @@ async def list_documents(
     db: AsyncSession = Depends(get_db),
     user: dict = Depends(get_current_user),
 ):
-    """List documents for an application."""
+    """List documents for an application (customers only see their own)."""
+    if user["role"] == ROLE_CUSTOMER:
+        owner = await db.execute(select(Application.customer_id).where(Application.id == app_id))
+        if owner.scalar() != user["sub"]:
+            raise HTTPException(403, "Access denied")
     result = await db.execute(
         select(Document).where(Document.application_id == app_id)
     )
     return result.scalars().all()
+
+
+@app.get("/documents/{doc_id}/file")
+async def download_document(
+    doc_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(get_current_user),
+):
+    """Return the uploaded file so an officer can review it (owner customers may view their own)."""
+    result = await db.execute(select(Document).options(undefer(Document.file_content)).where(Document.id == doc_id))
+    doc = result.scalars().first()
+    if not doc:
+        raise HTTPException(404, "Document not found")
+    if user["role"] == ROLE_CUSTOMER:
+        owner = await db.execute(select(Application.customer_id).where(Application.id == doc.application_id))
+        if owner.scalar() != user["sub"]:
+            raise HTTPException(403, "Access denied")
+
+    data = doc.file_content
+    if not data:
+        try:
+            from shared.storage import get_supabase_client
+            data = get_supabase_client().storage.from_(settings.storage_bucket).download(doc.file_path)
+        except Exception:
+            data = None
+    if not data:
+        raise HTTPException(404, "File content is not available")
+    return Response(
+        content=bytes(data),
+        media_type=doc.mime_type or "application/octet-stream",
+        headers={"Content-Disposition": f'inline; filename="{doc.file_name}"', "Cache-Control": "private, max-age=300"},
+    )
 
 
 @app.patch("/documents/{doc_id}/verify", response_model=DocumentResponse)
@@ -581,42 +683,7 @@ async def verify_document(
 
 
 # ═══════════════════════ ELIGIBILITY ENGINE ═══════════════════════
-
-def evaluate_rule(rule_config: dict, application: Application) -> tuple[bool, str]:
-    """Evaluate a single policy rule against an application. Returns (passed, reason)."""
-    rule_type = rule_config.get("type", "")
-    desc = rule_config.get("description", rule_type)
-
-    if rule_type == "min_income":
-        min_val = rule_config.get("min", 0)
-        passed = application.annual_income >= min_val
-        reason = f"Annual income ₹{application.annual_income:,.0f} {'≥' if passed else '<'} ₹{min_val:,.0f}"
-        return passed, reason
-
-    elif rule_type == "max_amount":
-        max_val = rule_config.get("max", float("inf"))
-        passed = application.requested_amount <= max_val
-        reason = f"Requested ₹{application.requested_amount:,.0f} {'≤' if passed else '>'} max ₹{max_val:,.0f}"
-        return passed, reason
-
-    elif rule_type == "max_emi_ratio":
-        max_ratio = rule_config.get("max_ratio", 0.5)
-        monthly_income = application.annual_income / 12
-        ratio = application.existing_emi / monthly_income if monthly_income > 0 else 1
-        passed = ratio <= max_ratio
-        reason = f"EMI ratio {ratio:.2%} {'≤' if passed else '>'} {max_ratio:.0%}"
-        return passed, reason
-
-    elif rule_type == "min_age":
-        # Stub: assume applicant meets age
-        return True, "Age requirement met (stub)"
-
-    elif rule_type == "employment_check":
-        passed = application.employment_type in ("Salaried", "Self-Employed", "Business")
-        reason = f"Employment type '{application.employment_type}' {'is' if passed else 'is not'} acceptable"
-        return passed, reason
-
-    return True, f"Unknown rule type '{rule_type}' – passed by default"
+# Rules are configured by managers (see /rules) and evaluated by rules_engine.
 
 
 @app.post("/applications/{app_id}/eligibility", response_model=EligibilityResponse)
@@ -634,17 +701,12 @@ async def check_eligibility(
     if not application:
         raise HTTPException(404, "Application not found")
 
-    # Load rules for this loan type
-    rules_result = await db.execute(
-        select(PolicyRule).where(
-            PolicyRule.loan_type == application.loan_type,
-            PolicyRule.is_active == True,
-        )
-    )
-    rules = rules_result.scalars().all()
+    # Load the currently active, manager-configured rules for this product
+    evaluated = await evaluate_eligibility_rules(db, application)
+    rules = [r for r, _, _ in evaluated]
 
     if not rules:
-        raise HTTPException(404, f"No policy rules found for '{application.loan_type}'")
+        raise HTTPException(404, f"No active eligibility rules found for '{application.loan_type}'")
 
     # Delete old results
     await db.execute(
@@ -654,8 +716,7 @@ async def check_eligibility(
     # Evaluate each rule
     results = []
     passed_count = 0
-    for rule in rules:
-        passed, reason = evaluate_rule(rule.rule_config, application)
+    for rule, passed, reason in evaluated:
         if passed:
             passed_count += 1
         rr = RuleResult(
@@ -696,6 +757,29 @@ async def check_eligibility(
     )
 
 
+@app.get("/applications/{app_id}/eligibility", response_model=EligibilityResponse)
+async def get_eligibility_results(
+    app_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(require_role(ROLE_EMPLOYEE, ROLE_MANAGER)),
+):
+    """Latest stored rule results for an application."""
+    result = await db.execute(select(Application).where(Application.id == app_id))
+    application = result.scalars().first()
+    if not application:
+        raise HTTPException(404, "Application not found")
+    rr = await db.execute(
+        select(RuleResult).where(RuleResult.application_id == app_id).order_by(RuleResult.evaluated_at.asc())
+    )
+    rows = rr.scalars().all()
+    return EligibilityResponse(
+        application_id=app_id,
+        passed=application.eligibility_passed,
+        total=application.eligibility_total,
+        results=[RuleResultResponse.model_validate(r, from_attributes=True) for r in rows],
+    )
+
+
 # ═══════════════════════ RISK SCORE ═══════════════════════
 
 @app.post("/applications/{app_id}/risk-score", response_model=RiskScoreResponse)
@@ -730,7 +814,12 @@ async def calculate_risk_score(
     except Exception:
         # Inline fallback scoring
         score = _inline_risk_score(application)
-        band = _score_to_band(score)
+        band = None
+
+    # Band cut-offs come from the manager-configured "risk_bands" rule when present
+    band_rule = await find_rule(db, application.loan_type, "risk_bands")
+    if band_rule or band is None:
+        band = _score_to_band(score, band_rule.rule_config if band_rule else None)
 
     application.risk_score = score
     application.risk_band = band
@@ -774,25 +863,21 @@ def _inline_risk_score(app: Application) -> float:
     return max(0, min(100, round(score, 1)))
 
 
-def _score_to_band(score: float) -> str:
-    if score >= 75:
+def _score_to_band(score: float, cfg: Optional[dict] = None) -> str:
+    cfg = cfg or {}
+    low_min = float(cfg.get("low_min", 75))
+    medium_min = float(cfg.get("medium_min", 50))
+    high_min = float(cfg.get("high_min", 25))
+    if score >= low_min:
         return RiskBand.LOW.value
-    elif score >= 50:
+    elif score >= medium_min:
         return RiskBand.MEDIUM.value
-    elif score >= 25:
+    elif score >= high_min:
         return RiskBand.HIGH.value
     return RiskBand.VERY_HIGH.value
 
 
 # ═══════════════════════ LIMIT CALCULATION ═══════════════════════
-
-# Product-level caps and income multiples
-PRODUCT_CONFIG = {
-    "Home Loan": {"income_multiple": 6.0, "max_cap": 10000000},
-    "Personal Loan": {"income_multiple": 3.0, "max_cap": 2000000},
-    "Vehicle Loan": {"income_multiple": 4.0, "max_cap": 5000000},
-}
-
 
 @app.post("/applications/{app_id}/limit", response_model=LimitResponse)
 async def calculate_limit(
@@ -810,9 +895,15 @@ async def calculate_limit(
     if not application:
         raise HTTPException(404, "Application not found")
 
-    config = PRODUCT_CONFIG.get(application.loan_type, {"income_multiple": 3.0, "max_cap": 5000000})
-    income_multiple = config["income_multiple"]
-    product_cap = config["max_cap"]
+    limit_rule = await find_rule(db, application.loan_type, "income_multiple_limit")
+    if not limit_rule:
+        raise HTTPException(
+            409,
+            f"No active loan-limit rule is configured for '{application.loan_type}'. "
+            "Ask a manager to add one under Rules & Regulations.",
+        )
+    income_multiple = float(limit_rule.rule_config.get("multiple", 0))
+    product_cap = float(limit_rule.rule_config.get("cap", 0))
 
     raw_limit = (application.annual_income * income_multiple) - (application.existing_emi * 12)
     max_limit = max(0, min(raw_limit, product_cap))
@@ -1340,6 +1431,16 @@ async def run_fraud_check(
     flags = []
     anomaly_score = 0.0
 
+    # Thresholds come from manager-configured fraud rules; a check without a rule is skipped
+    async def _fraud_cfg(rule_type: str) -> Optional[dict]:
+        rule = await find_rule(db, application.loan_type, rule_type)
+        return rule.rule_config if rule else None
+
+    income_cfg = await _fraud_cfg("fraud_income_variance")
+    lti_cfg = await _fraud_cfg("fraud_loan_to_income")
+    debt_cfg = await _fraud_cfg("fraud_debt_ratio")
+    delinq_cfg = await _fraud_cfg("fraud_delinquency")
+
     # 1. Duplicate document hashes across OTHER applications
     docs_res = await db.execute(select(Document).where(Document.application_id == app_id))
     docs = docs_res.scalars().all()
@@ -1360,36 +1461,42 @@ async def run_fraud_check(
 
     # 2. Income on statement differing from form by > 15%
     stmt_income = body.statement_income if body and body.statement_income is not None else None
-    if stmt_income is not None and application.annual_income > 0:
+    if income_cfg and stmt_income is not None and application.annual_income > 0:
         diff = abs(stmt_income - application.annual_income)
         diff_pct = (diff / application.annual_income) * 100.0
-        if diff_pct > 15.0:
+        max_pct = float(income_cfg.get("max_pct", 15))
+        if diff_pct > max_pct:
             flags.append(
                 f"Income on bank statement (₹{stmt_income:,.0f}) differs from form (₹{application.annual_income:,.0f}) "
-                f"by {diff_pct:.1f}% (threshold: 15%)"
+                f"by {diff_pct:.1f}% (threshold: {max_pct:g}%)"
             )
             anomaly_score += 0.35
 
     # 3. Unusual application patterns
     if application.annual_income > 0:
         lti = application.requested_amount / application.annual_income
-        if lti > 8.0:
-            flags.append(f"Unusual application: Requested loan amount is {lti:.1f}x annual income (standard policy <= 6x)")
+        if lti_cfg and lti > float(lti_cfg.get("max_multiple", 8)):
+            flags.append(
+                f"Unusual application: Requested loan amount is {lti:.1f}x annual income "
+                f"(policy threshold {float(lti_cfg.get('max_multiple', 8)):g}x)"
+            )
             anomaly_score += 0.20
         monthly_inc = application.annual_income / 12.0
-        if monthly_inc > 0 and (application.existing_emi / monthly_inc) > 0.60:
+        if debt_cfg and monthly_inc > 0 and (application.existing_emi / monthly_inc) > float(debt_cfg.get("max_ratio", 0.6)):
             flags.append(f"High debt load: Existing EMIs consume {(application.existing_emi / monthly_inc) * 100:.1f}% of gross income")
             anomaly_score += 0.15
 
     # 4. Abnormal repayment / prior default history
-    delinq_res = await db.execute(
-        select(CollectionCase)
-        .join(LoanAccount, CollectionCase.loan_account_id == LoanAccount.id)
-        .where(LoanAccount.customer_id == application.customer_id, CollectionCase.dpd > 30)
-    )
-    if delinq_res.scalars().all():
-        flags.append("Abnormal repayment pattern: Customer has past delinquent accounts exceeding 30 DPD")
-        anomaly_score += 0.30
+    if delinq_cfg:
+        max_dpd = int(delinq_cfg.get("max_dpd", 30))
+        delinq_res = await db.execute(
+            select(CollectionCase)
+            .join(LoanAccount, CollectionCase.loan_account_id == LoanAccount.id)
+            .where(LoanAccount.customer_id == application.customer_id, CollectionCase.dpd > max_dpd)
+        )
+        if delinq_res.scalars().all():
+            flags.append(f"Abnormal repayment pattern: Customer has past delinquent accounts exceeding {max_dpd} DPD")
+            anomaly_score += 0.30
 
     anomaly_score = min(1.0, round(anomaly_score, 2))
     if anomaly_score >= 0.50:
@@ -1469,6 +1576,136 @@ async def get_fraud_manual_review_queue(
             "created_at": alert.created_at,
         })
     return items
+
+
+# ═══════════════════════ RULES & REGULATIONS (manager module) ═══════════════════════
+
+def _rule_out(rule: PolicyRule) -> dict:
+    return {
+        "id": rule.id,
+        "loan_type": rule.loan_type,
+        "rule_name": rule.rule_name,
+        "rule_config": rule.rule_config,
+        "category": rules_engine.rule_category(rule.rule_config),
+        "is_active": bool(rule.is_active),
+        "is_mandatory": True if rule.is_mandatory is None else bool(rule.is_mandatory),
+        "created_by": rule.created_by,
+        "updated_by": rule.updated_by,
+        "created_at": rule.created_at,
+        "updated_at": rule.updated_at,
+    }
+
+
+def _validated(body: RuleWrite) -> dict:
+    try:
+        return rules_engine.validate_config(body.rule_config)
+    except rules_engine.RuleConfigError as exc:
+        raise HTTPException(422, str(exc))
+
+
+@app.get("/rules/catalog")
+async def rule_catalog(user: dict = Depends(require_role(ROLE_EMPLOYEE, ROLE_MANAGER))):
+    """Kinds of rule the engine can evaluate, with their parameters (drives the manager form)."""
+    return {"all_products": rules_engine.ALL_PRODUCTS, "types": rules_engine.RULE_CATALOG}
+
+
+@app.get("/rules")
+async def list_rules(
+    loan_type: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(require_role(ROLE_EMPLOYEE, ROLE_MANAGER)),
+):
+    query = select(PolicyRule).order_by(PolicyRule.loan_type, PolicyRule.rule_name)
+    if loan_type:
+        query = query.where(PolicyRule.loan_type == loan_type)
+    result = await db.execute(query)
+    return [_rule_out(r) for r in result.scalars().all()]
+
+
+@app.post("/rules", status_code=201)
+async def create_rule(
+    body: RuleWrite,
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(require_role(ROLE_MANAGER)),
+):
+    cfg = _validated(body)
+    rule = PolicyRule(
+        loan_type=body.loan_type.strip(), rule_name=body.rule_name.strip(), rule_config=cfg,
+        is_active=body.is_active, is_mandatory=body.is_mandatory, created_by=user["sub"], updated_by=user["sub"],
+    )
+    db.add(rule)
+    await db.flush()
+    await db.refresh(rule)
+    await write_audit(db, "policy_rule", rule.id, "rule_created", user["sub"], user.get("role", ""),
+                      new_value=f"{rule.loan_type}/{rule.rule_name}", details={"config": cfg, "mandatory": rule.is_mandatory})
+    return _rule_out(rule)
+
+
+@app.put("/rules/{rule_id}")
+async def update_rule(
+    rule_id: str,
+    body: RuleWrite,
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(require_role(ROLE_MANAGER)),
+):
+    result = await db.execute(select(PolicyRule).where(PolicyRule.id == rule_id))
+    rule = result.scalars().first()
+    if not rule:
+        raise HTTPException(404, "Rule not found")
+    cfg = _validated(body)
+    old = {"loan_type": rule.loan_type, "rule_name": rule.rule_name, "config": rule.rule_config,
+           "active": rule.is_active, "mandatory": rule.is_mandatory}
+    rule.loan_type = body.loan_type.strip()
+    rule.rule_name = body.rule_name.strip()
+    rule.rule_config = cfg
+    rule.is_active = body.is_active
+    rule.is_mandatory = body.is_mandatory
+    rule.updated_by = user["sub"]
+    rule.updated_at = datetime.now(timezone.utc)
+    await db.flush()
+    await db.refresh(rule)
+    await write_audit(db, "policy_rule", rule.id, "rule_updated", user["sub"], user.get("role", ""),
+                      old_value=json.dumps(old, default=str), new_value=json.dumps(cfg))
+    return _rule_out(rule)
+
+
+@app.patch("/rules/{rule_id}/active")
+async def set_rule_active(
+    rule_id: str,
+    body: RuleActiveRequest,
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(require_role(ROLE_MANAGER)),
+):
+    result = await db.execute(select(PolicyRule).where(PolicyRule.id == rule_id))
+    rule = result.scalars().first()
+    if not rule:
+        raise HTTPException(404, "Rule not found")
+    old = rule.is_active
+    rule.is_active = body.is_active
+    rule.updated_by = user["sub"]
+    rule.updated_at = datetime.now(timezone.utc)
+    await db.flush()
+    await db.refresh(rule)
+    await write_audit(db, "policy_rule", rule.id, "rule_activated" if body.is_active else "rule_deactivated",
+                      user["sub"], user.get("role", ""), old_value=str(old), new_value=str(body.is_active))
+    return _rule_out(rule)
+
+
+@app.delete("/rules/{rule_id}")
+async def delete_rule(
+    rule_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(require_role(ROLE_MANAGER)),
+):
+    result = await db.execute(select(PolicyRule).where(PolicyRule.id == rule_id))
+    rule = result.scalars().first()
+    if not rule:
+        raise HTTPException(404, "Rule not found")
+    label = f"{rule.loan_type}/{rule.rule_name}"
+    await db.delete(rule)
+    await write_audit(db, "policy_rule", rule_id, "rule_deleted", user["sub"], user.get("role", ""), old_value=label)
+    await db.flush()
+    return {"deleted": rule_id}
 
 
 # ═══════════════════════ ASSESSMENT REPORT ═══════════════════════

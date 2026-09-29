@@ -94,7 +94,11 @@ class DocumentResponse(BaseModel):
     file_name: str
     file_hash: str
     file_size: int
+    mime_type: Optional[str] = None
     status: str
+    fraud_score: Optional[float] = None
+    fraud_flag: Optional[str] = None
+    fraud_findings: Optional[list[str]] = None
     malware_scanned: bool
     malware_scan_status: Optional[str] = "CLEAN"
     verified_by: Optional[str]
@@ -311,3 +315,17 @@ class AnalyticsSummaryResponse(BaseModel):
     delinquency_metrics: dict[str, float]
 
 
+
+
+# ═══════════════════════ Rules & Regulations ═══════════════════════
+
+class RuleWrite(BaseModel):
+    loan_type: str = Field(..., min_length=1, max_length=100)   # product name, or "*" for all products
+    rule_name: str = Field(..., min_length=1, max_length=200)
+    rule_config: dict
+    is_active: bool = True
+    is_mandatory: bool = True
+
+
+class RuleActiveRequest(BaseModel):
+    is_active: bool

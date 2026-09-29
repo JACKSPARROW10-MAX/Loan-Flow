@@ -8,9 +8,9 @@ from datetime import datetime, timezone
 
 from sqlalchemy import (
     Column, String, Float, Integer, DateTime, Text, Boolean,
-    Enum as SAEnum, ForeignKey, JSON, Index,
+    Enum as SAEnum, ForeignKey, JSON, Index, LargeBinary,
 )
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, deferred
 
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -136,6 +136,12 @@ class Document(Base):
     verified_by = Column(String, nullable=True)
     verified_at = Column(DateTime(timezone=True), nullable=True)
     remarks = Column(Text, nullable=True)
+    # Document fraud analysis (see doc_fraud.py): score 0-1, flag CLEAN|SUSPICIOUS|HIGH_RISK
+    fraud_score = Column(Float, nullable=True)
+    fraud_flag = Column(String(20), nullable=True)
+    fraud_findings = Column(JSON, nullable=True)
+    # Copy of the file kept in the database when object storage is unavailable
+    file_content = deferred(Column(LargeBinary, nullable=True))
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     application = relationship("Application", back_populates="documents")
@@ -170,7 +176,13 @@ class PolicyRule(Base):
     rule_config = Column(JSON, nullable=False)
     # e.g. {"type": "min_income", "min": 300000, "description": "Minimum annual income ₹3L"}
     is_active = Column(Boolean, default=True)
+    # Mandatory rules block approval when they fail; advisory rules only warn
+    is_mandatory = Column(Boolean, default=True, server_default="true")
+    created_by = Column(String, nullable=True)
+    updated_by = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
+                        onupdate=lambda: datetime.now(timezone.utc))
 
 
 class AuditLog(Base):

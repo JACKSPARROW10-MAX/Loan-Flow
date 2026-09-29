@@ -131,6 +131,22 @@ def setup_test_database():
                 PolicyRule(rule_name="max_amount", loan_type="Personal Loan",
                            rule_config={"type": "max_amount", "max": 2000000,
                                         "description": "Max loan amount ₹20,00,000"}),
+                # Loan limit rules are configuration too (managers own them)
+                # Fraud thresholds are rules too (a check with no rule is skipped)
+                PolicyRule(rule_name="fraud_income_variance", loan_type="*",
+                           rule_config={"type": "fraud_income_variance", "max_pct": 15, "description": "x"}),
+                PolicyRule(rule_name="fraud_loan_to_income", loan_type="*",
+                           rule_config={"type": "fraud_loan_to_income", "max_multiple": 8, "description": "x"}),
+                PolicyRule(rule_name="fraud_debt_ratio", loan_type="*",
+                           rule_config={"type": "fraud_debt_ratio", "max_ratio": 0.6, "description": "x"}),
+                PolicyRule(rule_name="fraud_delinquency", loan_type="*",
+                           rule_config={"type": "fraud_delinquency", "max_dpd": 30, "description": "x"}),
+                PolicyRule(rule_name="loan_limit", loan_type="Home Loan",
+                           rule_config={"type": "income_multiple_limit", "multiple": 6.0, "cap": 10000000,
+                                        "description": "Home loan limit"}),
+                PolicyRule(rule_name="loan_limit", loan_type="Personal Loan",
+                           rule_config={"type": "income_multiple_limit", "multiple": 3.0, "cap": 2000000,
+                                        "description": "Personal loan limit"}),
             ]
             session.add_all(rules)
             await session.commit()
@@ -148,6 +164,10 @@ def setup_test_database():
         asyncio.run(_clean())
     except Exception:
         pass
+
+
+# The suite creates many applications quickly; disable the per-IP rate limiter for it
+loan_app.state.limiter.enabled = False
 
 
 def run_async_test(coro_fn):
@@ -313,7 +333,7 @@ def test_full_loan_lifecycle_and_maker_checker():
                                         json={"target_stage": "Approved",
                                                "remarks": "Approved"},
                                         cookies=mgr)
-            assert res_mgr.status_code == 200
+            assert res_mgr.status_code == 200, res_mgr.text
             assert res_mgr.json()["new_stage"] == "Approved"
 
             # 12. Disburse → EMI Schedule
@@ -819,5 +839,137 @@ def test_registration_requires_approval():
             assert r.status_code == 200
             r = await client.post("/auth/login", json={"username": "newoff", "password": "pw123456"})
             assert r.status_code == 200
+
+    run_async_test(_run)
+
+
+
+# ═══════════════════════ TEST 14 — Manager-managed rules ═══════════════════════
+
+def test_manager_rules_crud_and_dynamic_approval_gate():
+    """Managers manage rules; approval dynamically applies the active mandatory rules."""
+    async def _run():
+        transport = ASGITransport(app=loan_app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            cust = get_auth_cookies("cust-101", "customer", "amit_customer")
+            emp = get_auth_cookies("emp-201", "employee", "rahul_maker")
+            mgr = get_auth_cookies("mgr-301", "manager", "priya_checker")
+
+            new_rule = {"loan_type": "Personal Loan", "rule_name": "test_high_income",
+                        "rule_config": {"type": "min_income", "min": 10000000, "description": "Very high income"},
+                        "is_active": True, "is_mandatory": True}
+
+            # Only managers can create rules; employees can read them
+            r = await client.post("/rules", json=new_rule, cookies=emp)
+            assert r.status_code == 403
+            r = await client.get("/rules", cookies=emp)
+            assert r.status_code == 200 and len(r.json()) > 0
+            r = await client.get("/rules", cookies=cust)
+            assert r.status_code == 403
+
+            # Invalid rule type / parameters are rejected
+            bad = dict(new_rule, rule_config={"type": "nonsense"})
+            assert (await client.post("/rules", json=bad, cookies=mgr)).status_code == 422
+            bad = dict(new_rule, rule_config={"type": "min_income", "min": "abc"})
+            assert (await client.post("/rules", json=bad, cookies=mgr)).status_code == 422
+
+            # Application that passes the seeded rules, walked up to the manager
+            res = await client.post("/applications", json={
+                "loan_type": "Personal Loan", "requested_amount": 300000,
+                "annual_income": 900000, "existing_emi": 0,
+                "employment_type": "Salaried", "employer_name": "TCS",
+                "loan_tenure_months": 36, "customer_name": "Amit Sharma",
+            }, cookies=cust)
+            app_id = res.json()["id"]
+            await client.post(f"/applications/{app_id}/transition", json={"target_stage": "Submitted"}, cookies=cust)
+            for stage in ["KYC", "Docs", "Verification", "Risk", "Prepared", "With Manager"]:
+                r = await client.post(f"/applications/{app_id}/transition", json={"target_stage": stage}, cookies=emp)
+                assert r.status_code == 200, r.text
+
+            # Manager adds a stricter mandatory rule: eligibility and approval both see it immediately
+            r = await client.post("/rules", json=new_rule, cookies=mgr)
+            assert r.status_code == 201
+            rule_id = r.json()["id"]
+            r = await client.post(f"/applications/{app_id}/eligibility", cookies=emp)
+            assert any(x["rule_name"] == "test_high_income" and not x["passed"] for x in r.json()["results"])
+            r = await client.post(f"/applications/{app_id}/transition", json={"target_stage": "Approved"}, cookies=mgr)
+            assert r.status_code == 400 and "test_high_income" in r.text
+
+            # Deactivating it lifts the block
+            r = await client.patch(f"/rules/{rule_id}/active", json={"is_active": False}, cookies=mgr)
+            assert r.status_code == 200 and r.json()["is_active"] is False
+            r = await client.post(f"/applications/{app_id}/transition", json={"target_stage": "Approved"}, cookies=mgr)
+            assert r.status_code == 200, r.text
+
+            # Update and delete
+            r = await client.put(f"/rules/{rule_id}", json=dict(new_rule, rule_config={
+                "type": "min_income", "min": 1, "description": "changed"}, is_active=False), cookies=mgr)
+            assert r.status_code == 200 and r.json()["rule_config"]["min"] == 1.0
+            assert (await client.delete(f"/rules/{rule_id}", cookies=mgr)).status_code == 200
+
+    run_async_test(_run)
+
+
+def test_limit_requires_configured_rule():
+    """The limit comes from a manager-configured rule, not from code."""
+    async def _run():
+        transport = ASGITransport(app=loan_app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            cust = get_auth_cookies("cust-101", "customer", "amit_customer")
+            emp = get_auth_cookies("emp-201", "employee", "rahul_maker")
+            res = await client.post("/applications", json={
+                "loan_type": "Vehicle Loan", "requested_amount": 100000, "annual_income": 600000,
+                "existing_emi": 0, "employment_type": "Salaried", "employer_name": "X",
+                "loan_tenure_months": 24, "customer_name": "Amit Sharma"}, cookies=cust)
+            app_id = res.json()["id"]
+            r = await client.post(f"/applications/{app_id}/limit", cookies=emp)
+            assert r.status_code == 409
+
+    run_async_test(_run)
+
+
+def test_document_fraud_analysis_and_file_review():
+    """Uploads are scored for fraud and the officer can retrieve the file to review it."""
+    import io
+    from PIL import Image
+
+    def png_bytes(color):
+        buf = io.BytesIO()
+        Image.new("RGB", (640, 480), color).save(buf, "PNG")
+        return buf.getvalue()
+
+    async def _run():
+        transport = ASGITransport(app=loan_app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            cust = get_auth_cookies("cust-101", "customer", "amit_customer")
+            emp = get_auth_cookies("emp-201", "employee", "rahul_maker")
+            res = await client.post("/applications", json={
+                "loan_type": "Personal Loan", "requested_amount": 100000, "annual_income": 600000,
+                "existing_emi": 0, "employment_type": "Salaried", "employer_name": "X",
+                "loan_tenure_months": 24, "customer_name": "Amit Sharma"}, cookies=cust)
+            app_id = res.json()["id"]
+
+            good = png_bytes((10, 120, 200))
+            r = await client.post(f"/applications/{app_id}/documents", cookies=cust,
+                                  data={"document_type": "PAN"}, files={"file": ("pan.png", good, "image/png")})
+            assert r.status_code == 201, r.text
+            doc = r.json()
+            assert doc["fraud_flag"] in ("CLEAN", "SUSPICIOUS", "HIGH_RISK")
+            assert isinstance(doc["fraud_findings"], list) and doc["fraud_findings"]
+
+            # PNG content disguised as a PDF is flagged with a specific finding
+            r = await client.post(f"/applications/{app_id}/documents", cookies=cust,
+                                  data={"document_type": "Income Proof"},
+                                  files={"file": ("salary.pdf", png_bytes((200, 30, 30)), "application/pdf")})
+            assert r.status_code == 201
+            assert any("extension" in f for f in r.json()["fraud_findings"])
+            assert r.json()["fraud_score"] > doc["fraud_score"]
+
+            # Officer sees documents with their analysis, and can open the stored file
+            r = await client.get(f"/applications/{app_id}/documents", cookies=emp)
+            assert len(r.json()) == 2 and all("fraud_flag" in d for d in r.json())
+            r = await client.get(f"/documents/{doc['id']}/file", cookies=emp)
+            assert r.status_code == 200 and r.content == good
+            assert r.headers["content-type"].startswith("image/png")
 
     run_async_test(_run)

@@ -8,6 +8,7 @@ import { ManagerApprovalDesk } from '@/components/ManagerApprovalDesk';
 import { AnalyticsDashboard } from '@/components/AnalyticsDashboard';
 import { LoginPage } from '@/components/LoginPage';
 import { PendingApprovals } from '@/components/PendingApprovals';
+import { RulesManager } from '@/components/RulesManager';
 import {
   Role,
   ApplicationItem,
@@ -35,19 +36,15 @@ import {
   logout as apiLogout,
   SessionUser,
   fetchAuditLogs,
+  fetchDocuments,
+  fetchEligibilityResults,
 } from '@/lib/api';
-import {
-  INITIAL_APPLICATIONS,
-  INITIAL_LOAN_ACCOUNT,
-  INITIAL_COLLECTION_CASES,
-  INITIAL_AUDIT_LOGS,
-} from '@/lib/mockData';
 
 export default function Home() {
   const [user, setUser] = useState<SessionUser | null>(null);
   const [sessionChecked, setSessionChecked] = useState<boolean>(false);
   const currentRole: Role = user?.role ?? 'customer';
-  const [activeTab, setActiveTab] = useState<'portal' | 'analytics'>('portal');
+  const [activeTab, setActiveTab] = useState<'portal' | 'analytics' | 'rules'>('portal');
 
   // Core state
   const [applications, setApplications] = useState<ApplicationItem[]>([]);
@@ -57,27 +54,45 @@ export default function Home() {
   const [isLiveConnected, setIsLiveConnected] = useState<boolean>(false);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const [notice, setNotice] = useState<{ kind: 'error' | 'ok'; message: string } | null>(null);
+  const notify = (kind: 'error' | 'ok', message: string) => setNotice({ kind, message });
 
   // Sync data from the real backend API
   const syncWithBackend = useCallback(async (role: Role) => {
     setIsLoading(true);
     try {
-      // 2. Fetch live applications from PostgreSQL
       const liveApps = await fetchApplications();
-      setApplications(liveApps);
 
-      // 3. Fetch servicing accounts
-      const accounts = await fetchLoanAccounts();
-      if (accounts && accounts.length > 0) {
-        setLoanAccount(accounts[0]);
-      } else {
-        setLoanAccount(undefined);
+      // Customers need their own documents; officers load them per application on demand
+      const docsByApp: Record<string, DocumentItem[]> = {};
+      if (role === 'customer') {
+        await Promise.all(
+          liveApps.map(async (a) => {
+            try {
+              docsByApp[a.id] = await fetchDocuments(a.id);
+            } catch {
+              /* leave empty */
+            }
+          })
+        );
       }
+      setApplications((prev) =>
+        liveApps.map((a) => {
+          const old = prev.find((p) => p.id === a.id);
+          return {
+            ...a,
+            documents: docsByApp[a.id] ?? old?.documents ?? [],
+            rule_results: old?.rule_results ?? [],
+          };
+        })
+      );
 
-      // 4. Fetch collection cases (officers and managers only)
+      const accounts = await fetchLoanAccounts();
+      setLoanAccount(accounts && accounts.length > 0 ? accounts[0] : undefined);
+
+      // Collection cases are visible to officers and managers only
       if (role !== 'customer') {
-        const cases = await fetchCollectionCases();
-        setCollectionCases(cases || []);
+        setCollectionCases((await fetchCollectionCases()) || []);
       } else {
         setCollectionCases([]);
       }
@@ -92,16 +107,35 @@ export default function Home() {
         setIsLoading(false);
         return;
       }
-      console.warn('[LoanFlow UI] Backend connection failed, using fallback data:', err);
       setIsLiveConnected(false);
-      setStatusMessage(`API offline or starting up: ${err.message}`);
-      // Fallback only if server is unreachable
-      setApplications((prev) => (prev.length > 0 ? prev : INITIAL_APPLICATIONS));
-      setLoanAccount((prev) => prev || INITIAL_LOAN_ACCOUNT);
-      setCollectionCases((prev) => (prev.length > 0 ? prev : INITIAL_COLLECTION_CASES));
-      setAuditLogs((prev) => (prev.length > 0 ? prev : INITIAL_AUDIT_LOGS));
+      setStatusMessage(`Cannot reach the server: ${err?.message || 'unknown error'}`);
     } finally {
       setIsLoading(false);
+    }
+  }, []);
+
+  // Documents and stored rule results for one application (not part of the list response)
+  const loadDetails = useCallback(async (appId: string) => {
+    try {
+      const [docs, elig] = await Promise.all([
+        fetchDocuments(appId),
+        fetchEligibilityResults(appId).catch(() => null),
+      ]);
+      setApplications((prev) =>
+        prev.map((a) =>
+          a.id === appId
+            ? {
+                ...a,
+                documents: docs,
+                ...(elig
+                  ? { rule_results: elig.results, eligibility_passed: elig.passed, eligibility_total: elig.total }
+                  : {}),
+              }
+            : a
+        )
+      );
+    } catch {
+      /* the file list stays as it was */
     }
   }, []);
 
@@ -160,57 +194,32 @@ export default function Home() {
     setAuditLogs((prev) => [newLog, ...prev]);
   };
 
-  // 1. Customer creates new application (calls real backend POST /applications)
+  // Stage names accepted by the backend state machine, in order
+  const OFFICER_PIPELINE = ['Submitted', 'KYC', 'Docs', 'Verification', 'Risk', 'Prepared', 'With Manager'];
+
+  // 1. Customer creates a new application and submits it for review
   const handleNewApplication = async (data: Partial<ApplicationItem>) => {
     try {
-      const payload = {
+      const created = await apiCreateApplication({
         loan_type: data.loan_type || 'Home Loan',
-        requested_amount: Number(data.requested_amount) || 2500000,
-        annual_income: Number(data.annual_income) || 1200000,
+        requested_amount: Number(data.requested_amount),
+        annual_income: Number(data.annual_income),
         existing_emi: Number(data.existing_emi) || 0,
         employment_type: data.employment_type || 'Salaried',
-        employer_name: data.employer_name || 'Tata Consultancy Services',
-        loan_tenure_months: Number(data.loan_tenure_months) || 120,
-        customer_name: data.customer_name || user?.full_name || 'Customer',
-      };
-
-      const created = await apiCreateApplication(payload);
-      logAudit('application', created.id, 'created', `Created ${created.app_number}: ₹${created.requested_amount.toLocaleString()}`);
-      
-      // Refresh applications from backend
-      await syncWithBackend(currentRole);
-      setStatusMessage(`Application ${created.app_number} successfully saved to PostgreSQL!`);
-    } catch (err: any) {
-      console.error('Error creating application via API:', err);
-      // Fallback creation for offline mode
-      const nextNum = 1042 + applications.length;
-      const newApp: ApplicationItem = {
-        id: `app-${nextNum}`,
-        app_number: `LF-${nextNum}`,
-        customer_id: 'cust-101',
-        customer_name: data.customer_name || 'Amit Sharma',
-        loan_type: data.loan_type || 'Home Loan',
-        requested_amount: data.requested_amount || 2500000,
-        annual_income: data.annual_income || 1200000,
-        existing_emi: data.existing_emi || 0,
-        employment_type: data.employment_type || 'Salaried',
         employer_name: data.employer_name || '',
-        loan_tenure_months: data.loan_tenure_months || 120,
-        eligibility_passed: 0,
-        eligibility_total: 0,
-        stage: 'Submitted',
-        kyc_verified: true,
-        sla_days: 7,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-        documents: [],
-        rule_results: [],
-      };
-      setApplications((prev) => [newApp, ...prev]);
+        loan_tenure_months: Number(data.loan_tenure_months),
+        customer_name: data.customer_name || user?.full_name || '',
+      });
+      await transitionApplicationStage(created.id, 'Submitted');
+      logAudit('application', created.id, 'created', `Created ${created.app_number}: ₹${created.requested_amount.toLocaleString()}`);
+      await syncWithBackend(currentRole);
+      notify('ok', `Application ${created.app_number} submitted for review.`);
+    } catch (err: any) {
+      notify('error', err?.message || 'Could not create the application');
     }
   };
 
-  // 2. Upload Document with real duplicate detection via SHA-256 hash
+  // 2. Upload a document (SHA-256 duplicate detection happens on the server too)
   const handleUploadDocument = async (
     appId: string,
     docType: string,
@@ -218,314 +227,123 @@ export default function Home() {
     fileHash: string,
     fileObj?: File
   ): Promise<boolean> => {
-    // 1. Check local hash collision
-    const isDuplicate = applications.some((app) =>
-      app.documents?.some((d) => d.file_hash === fileHash)
-    );
+    const isDuplicate = applications.some((app) => app.documents?.some((d) => d.file_hash === fileHash));
     if (isDuplicate) {
       logAudit('document', 'hash-check', 'duplicate_rejected', `Duplicate file hash ${fileHash.substring(0, 16)} rejected`);
       return false;
     }
-
+    if (!fileObj) return false;
     try {
-      if (fileObj) {
-        await apiUploadDocument(appId, docType, fileObj);
-        await syncWithBackend(currentRole);
-        return true;
-      }
+      await apiUploadDocument(appId, docType, fileObj);
+      await syncWithBackend(currentRole);
+      return true;
     } catch (err: any) {
-      if (err.message && err.message.toLowerCase().includes('duplicate')) {
-        logAudit('document', 'hash-check', 'duplicate_rejected', `Backend rejected duplicate file hash`);
+      if (err?.message && err.message.toLowerCase().includes('duplicate')) {
+        logAudit('document', 'hash-check', 'duplicate_rejected', 'Backend rejected duplicate file hash');
         return false;
       }
-      console.warn('Backend doc upload warning, recording local:', err);
+      throw err;
     }
-
-    // Local fallback state
-    const newDoc: DocumentItem = {
-      id: `doc-${Date.now()}`,
-      application_id: appId,
-      document_type: docType,
-      file_name: fileName,
-      file_hash: fileHash,
-      file_size: fileObj ? fileObj.size : 1024 * 750,
-      status: 'Pending',
-      malware_scanned: true,
-      created_at: new Date().toISOString(),
-    };
-
-    setApplications((prev) =>
-      prev.map((app) => {
-        if (app.id === appId) {
-          const docs = app.documents ? [...app.documents, newDoc] : [newDoc];
-          return { ...app, documents: docs };
-        }
-        return app;
-      })
-    );
-
-    logAudit('document', newDoc.id, 'uploaded', `${docType}: ${fileName} (SHA-256: ${fileHash.substring(0, 12)}...)`);
-    return true;
   };
 
-  // 3. Verify Document
+  // 3. Officer verifies or rejects a document after reviewing it
   const handleVerifyDocument = async (docId: string, status: 'Verified' | 'Mismatch', remarks?: string) => {
     try {
       await apiVerifyDocument(docId, status, remarks);
-      await syncWithBackend(currentRole);
-    } catch {
-      setApplications((prev) =>
-        prev.map((app) => {
-          const docExists = app.documents?.some((d) => d.id === docId);
-          if (docExists && app.documents) {
-            const updatedDocs = app.documents.map((d) =>
-              d.id === docId
-                ? {
-                    ...d,
-                    status,
-                    remarks,
-                    verified_by: 'emp-201',
-                    verified_at: new Date().toISOString(),
-                  }
-                : d
-            );
-            return { ...app, documents: updatedDocs };
-          }
-          return app;
-        })
-      );
+      const owner = applications.find((a) => a.documents?.some((d) => d.id === docId));
+      if (owner) await loadDetails(owner.id);
+      logAudit('document', docId, 'verified', `Status set to ${status}${remarks ? ': ' + remarks : ''}`);
+    } catch (err: any) {
+      notify('error', err?.message || 'Could not update the document');
     }
-    logAudit('document', docId, 'verified', `Status set to ${status}${remarks ? ': ' + remarks : ''}`);
   };
 
-  // 4. Run Policy & Eligibility Rules (calls real backend POST /applications/{id}/eligibility)
+  // 4. Run the manager-configured eligibility rules
   const handleRunRules = async (appId: string) => {
     try {
       const res = await apiRunEligibility(appId);
-      if (res && res.results) {
-        setApplications((prev) =>
-          prev.map((app) =>
-            app.id === appId
-              ? {
-                  ...app,
-                  rule_results: res.results,
-                  eligibility_passed: res.passed,
-                  eligibility_total: res.total,
-                }
-              : app
-          )
-        );
-        logAudit('application', appId, 'eligibility_checked', `Executed policy rules on backend. Passed ${res.passed}/${res.total}`);
-        return;
-      }
-    } catch (err) {
-      console.warn('Eligibility API fallback to local evaluation:', err);
+      setApplications((prev) =>
+        prev.map((app) =>
+          app.id === appId
+            ? { ...app, rule_results: res.results, eligibility_passed: res.passed, eligibility_total: res.total }
+            : app
+        )
+      );
+      logAudit('application', appId, 'eligibility_checked', `Executed policy rules. Passed ${res.passed}/${res.total}`);
+    } catch (err: any) {
+      notify('error', err?.message || 'Could not run the eligibility rules');
     }
-
-    // Local evaluation fallback
-    setApplications((prev) =>
-      prev.map((app) => {
-        if (app.id === appId) {
-          const rules: RuleResultItem[] = [
-            {
-              id: `rr-${Date.now()}-1`,
-              rule_name: 'min_income',
-              rule_description: 'Minimum annual income threshold',
-              passed: app.annual_income >= 300000,
-              reason: `Annual income ₹${app.annual_income.toLocaleString()} ${
-                app.annual_income >= 300000 ? '≥' : '<'
-              } ₹3,00,000 threshold`,
-              evaluated_at: new Date().toISOString(),
-            },
-            {
-              id: `rr-${Date.now()}-2`,
-              rule_name: 'max_emi_ratio',
-              rule_description: 'Total EMI obligations ≤ 50% monthly income',
-              passed: app.existing_emi / (app.annual_income / 12) <= 0.5,
-              reason: `Current obligations ratio ${(
-                (app.existing_emi / (app.annual_income / 12)) *
-                100
-              ).toFixed(1)}% ≤ 50.0% policy cap`,
-              evaluated_at: new Date().toISOString(),
-            },
-            {
-              id: `rr-${Date.now()}-3`,
-              rule_name: 'employment_check',
-              rule_description: 'Approved employer category and vintage',
-              passed: true,
-              reason: `Employer category ${app.employer_name || 'Salaried'} verified in Tier-1 database`,
-              evaluated_at: new Date().toISOString(),
-            },
-            {
-              id: `rr-${Date.now()}-4`,
-              rule_name: 'max_loan_amount',
-              rule_description: 'Product loan amount policy cap',
-              passed: app.requested_amount <= 10000000,
-              reason: `Requested ₹${app.requested_amount.toLocaleString()} is within product ceiling`,
-              evaluated_at: new Date().toISOString(),
-            },
-          ];
-
-          const passedCount = rules.filter((r) => r.passed).length;
-          return {
-            ...app,
-            rule_results: rules,
-            eligibility_passed: passedCount,
-            eligibility_total: rules.length,
-          };
-        }
-        return app;
-      })
-    );
-    logAudit('application', appId, 'eligibility_checked', 'Executed 4 policy rules. Passed all explainability tests.');
   };
 
-  // 5. Calculate Risk Score (calls real backend POST /applications/{id}/risk-score)
+  // 5. Risk score
   const handleCalculateRisk = async (appId: string) => {
     try {
       const res = await apiCalculateRisk(appId);
-      if (res && res.score !== undefined) {
-        setApplications((prev) =>
-          prev.map((app) =>
-            app.id === appId
-              ? { ...app, risk_score: res.score, risk_band: res.band }
-              : app
-          )
-        );
-        logAudit('application', appId, 'risk_scored', `Backend Risk Score: ${res.score}/100, Band: ${res.band}`);
-        return;
-      }
-    } catch (err) {
-      console.warn('Risk API fallback:', err);
+      setApplications((prev) =>
+        prev.map((app) => (app.id === appId ? { ...app, risk_score: res.score, risk_band: res.band } : app))
+      );
+      logAudit('application', appId, 'risk_scored', `Risk score: ${res.score}/100, Band: ${res.band}`);
+    } catch (err: any) {
+      notify('error', err?.message || 'Could not calculate the risk score');
     }
-
-    setApplications((prev) =>
-      prev.map((app) => (app.id === appId ? { ...app, risk_score: 84.0, risk_band: 'Low' } : app))
-    );
-    logAudit('application', appId, 'risk_scored', 'Credit risk score: 84.0/100, Band: Low');
   };
 
-  // 6. Calculate Permissible Limit (calls real backend POST /applications/{id}/limit)
+  // 6. Permissible limit (from the manager-configured limit rule)
   const handleCalculateLimit = async (appId: string) => {
     try {
       const res = await apiCalculateLimit(appId);
-      if (res && res.max_permissible_limit !== undefined) {
-        setApplications((prev) =>
-          prev.map((app) =>
-            app.id === appId
-              ? { ...app, max_permissible_limit: res.max_permissible_limit }
-              : app
-          )
-        );
-        logAudit('application', appId, 'limit_calculated', `Calculated limit: ₹${res.max_permissible_limit.toLocaleString()}`);
-        return;
-      }
-    } catch (err) {
-      console.warn('Limit API fallback:', err);
+      setApplications((prev) =>
+        prev.map((app) => (app.id === appId ? { ...app, max_permissible_limit: res.max_permissible_limit } : app))
+      );
+      logAudit('application', appId, 'limit_calculated', `Calculated limit: ₹${res.max_permissible_limit.toLocaleString()}`);
+    } catch (err: any) {
+      notify('error', err?.message || 'Could not calculate the limit');
     }
-
-    setApplications((prev) =>
-      prev.map((app) => {
-        if (app.id === appId) {
-          const maxLimit = Math.min(
-            app.annual_income * 6.0 - app.existing_emi * 12,
-            10000000
-          );
-          return { ...app, max_permissible_limit: Math.max(0, maxLimit) };
-        }
-        return app;
-      })
-    );
-    logAudit('application', appId, 'limit_calculated', 'Max permissible limit determined based on income multiplier');
   };
 
-  // 7. Submit to Manager (Lock Maker Stage, calls real backend transition)
+  // 7. Officer submits the prepared file to the manager (walks the state machine)
   const handleSubmitToManager = async (appId: string, remarks: string) => {
+    const target = applications.find((a) => a.id === appId);
+    if (!target) return;
     try {
-      await transitionApplicationStage(appId, 'with_manager', remarks);
+      let stage = target.stage as string;
+      if (stage === 'Draft') {
+        throw new Error('This application is still a draft. The customer must submit it first.');
+      }
+      if (stage === 'Returned') {
+        await transitionApplicationStage(appId, 'Submitted');
+        stage = 'Submitted';
+      }
+      const from = OFFICER_PIPELINE.indexOf(stage);
+      if (from === -1) throw new Error(`Cannot submit an application in stage "${stage}"`);
+      for (let i = from + 1; i < OFFICER_PIPELINE.length; i++) {
+        await transitionApplicationStage(appId, OFFICER_PIPELINE[i], i === OFFICER_PIPELINE.length - 1 ? remarks : undefined);
+      }
+      logAudit('application', appId, 'stage_changed', 'With Manager', stage, { remarks });
       await syncWithBackend(currentRole);
-    } catch {
-      setApplications((prev) =>
-        prev.map((app) =>
-          app.id === appId
-            ? {
-                ...app,
-                stage: 'With Manager',
-                prepared_by: 'emp-201',
-                updated_at: new Date().toISOString(),
-              }
-            : app
-        )
-      );
+      notify('ok', `${target.app_number} submitted to the manager.`);
+    } catch (err: any) {
+      notify('error', err?.message || 'Could not submit to the manager');
+      await syncWithBackend(currentRole);
     }
-    logAudit('application', appId, 'stage_changed', 'With Manager', 'Verification', { remarks });
   };
 
-  // 8. Manager Decision: Approve (Dual control maker-checker)
-  const handleApprove = async (appId: string, remarks: string) => {
+  // 8-10. Manager decisions (the server applies maker-checker and the active mandatory rules)
+  const decide = async (appId: string, stage: 'Approved' | 'Returned' | 'Rejected', remarks: string) => {
     try {
-      await transitionApplicationStage(appId, 'approved', remarks);
+      await transitionApplicationStage(appId, stage, remarks);
+      logAudit('application', appId, 'stage_changed', stage, 'With Manager', { remarks });
       await syncWithBackend(currentRole);
-    } catch {
-      setApplications((prev) =>
-        prev.map((app) =>
-          app.id === appId
-            ? {
-                ...app,
-                stage: 'Approved',
-                approved_by: 'mgr-301',
-                updated_at: new Date().toISOString(),
-              }
-            : app
-        )
-      );
+      notify('ok', `Application ${stage.toLowerCase()}.`);
+    } catch (err: any) {
+      notify('error', err?.message || `Could not mark the application ${stage.toLowerCase()}`);
     }
-    logAudit('application', appId, 'stage_changed', 'Approved', 'With Manager', { remarks });
   };
+  const handleApprove = (appId: string, remarks: string) => decide(appId, 'Approved', remarks);
+  const handleReturn = (appId: string, remarks: string) => decide(appId, 'Returned', remarks);
+  const handleReject = (appId: string, remarks: string) => decide(appId, 'Rejected', remarks);
 
-  // 9. Manager Decision: Return
-  const handleReturn = async (appId: string, remarks: string) => {
-    try {
-      await transitionApplicationStage(appId, 'returned', remarks);
-      await syncWithBackend(currentRole);
-    } catch {
-      setApplications((prev) =>
-        prev.map((app) =>
-          app.id === appId
-            ? {
-                ...app,
-                stage: 'Submitted',
-                updated_at: new Date().toISOString(),
-              }
-            : app
-        )
-      );
-    }
-    logAudit('application', appId, 'stage_changed', 'Returned to Maker', 'With Manager', { remarks });
-  };
-
-  // 10. Manager Decision: Reject
-  const handleReject = async (appId: string, remarks: string) => {
-    try {
-      await transitionApplicationStage(appId, 'rejected', remarks);
-      await syncWithBackend(currentRole);
-    } catch {
-      setApplications((prev) =>
-        prev.map((app) =>
-          app.id === appId
-            ? {
-                ...app,
-                stage: 'Rejected',
-                updated_at: new Date().toISOString(),
-              }
-            : app
-        )
-      );
-    }
-    logAudit('application', appId, 'stage_changed', 'Rejected', 'With Manager', { remarks });
-  };
-
-  // 11. Disburse Loan (calls real backend POST /applications/{id}/disburse)
+  // 11. Disburse loan
   const handleDisburse = async (appId: string, interestRate: number) => {
     try {
       const account = await apiDisburseLoan(appId, interestRate);
@@ -537,101 +355,32 @@ export default function Home() {
         'disbursed',
         `Disbursed ₹${account.principal_amount.toLocaleString()} at ${interestRate}% for Account ${account.account_number}`
       );
-      return;
-    } catch (err) {
-      console.warn('Disburse API fallback to local generation:', err);
+      notify('ok', `Loan disbursed (${account.account_number}).`);
+    } catch (err: any) {
+      notify('error', err?.message || 'Could not disburse the loan');
     }
-
-    const target = applications.find((a) => a.id === appId);
-    if (!target) return;
-
-    const P = target.requested_amount;
-    const r = interestRate / 12 / 100;
-    const n = target.loan_tenure_months || 120;
-    const emi = Math.round((P * r * Math.pow(1 + r, n)) / (Math.pow(1 + r, n) - 1));
-
-    const newAccount: LoanAccountItem = {
-      id: `loan-acc-${target.app_number.replace('LF-', '')}`,
-      account_number: `LN-${target.app_number.replace('LF-', '')}`,
-      application_id: target.id,
-      customer_id: target.customer_id,
-      principal_amount: P,
-      interest_rate: interestRate,
-      tenure_months: n,
-      emi_amount: emi,
-      outstanding_balance: P,
-      total_paid: 0,
-      status: 'ACTIVE',
-      disbursed_at: new Date().toISOString(),
-      next_due_date: new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString(),
-      schedules: Array.from({ length: 6 }).map((_, i) => ({
-        id: `sch-${i + 1}`,
-        installment_number: i + 1,
-        due_date: new Date(Date.now() + (i + 1) * 30 * 24 * 3600 * 1000).toISOString(),
-        emi_amount: emi,
-        principal_component: Math.round(emi * 0.25),
-        interest_component: Math.round(emi * 0.75),
-        outstanding_principal: P - Math.round(emi * 0.25 * (i + 1)),
-        status: 'PENDING',
-        paid_amount: 0,
-      })),
-    };
-
-    setLoanAccount(newAccount);
-    logAudit(
-      'loan_account',
-      newAccount.id,
-      'disbursed',
-      `Disbursed ₹${P.toLocaleString()} at ${interestRate}% for Account ${newAccount.account_number}`
-    );
   };
 
-  // 12. Repay EMI (calls real backend POST /servicing/accounts/{id}/pay)
+  // 12. Repay EMI
   const handlePayEmi = async (accountId: string, amount: number) => {
     try {
       await apiPayEmi(accountId, amount);
       await syncWithBackend(currentRole);
-    } catch {
-      setLoanAccount((prev) => {
-        if (!prev) return undefined;
-        const schedules = prev.schedules ? [...prev.schedules] : [];
-        const firstPending = schedules.find((s) => s.status === 'PENDING');
-        if (firstPending) {
-          firstPending.status = 'PAID';
-          firstPending.paid_at = new Date().toISOString();
-          firstPending.paid_amount = amount;
-        }
-
-        return {
-          ...prev,
-          outstanding_balance: Math.max(0, prev.outstanding_balance - amount),
-          total_paid: prev.total_paid + amount,
-          schedules,
-        };
-      });
+      logAudit('payment', accountId, 'repayment_received', `Received EMI payment of ₹${amount.toLocaleString()}`);
+    } catch (err: any) {
+      notify('error', err?.message || 'Payment failed');
     }
-    logAudit('payment', accountId, 'repayment_received', `Received EMI payment of ₹${amount.toLocaleString()}`);
   };
 
-  // 13. Update Collection Note (calls real backend follow-up)
+  // 13. Collection follow-up note
   const handleUpdateCollectionNote = async (caseId: string, note: string) => {
     try {
       await addCollectionFollowUp(caseId, note);
       await syncWithBackend(currentRole);
-    } catch {
-      setCollectionCases((prev) =>
-        prev.map((c) =>
-          c.id === caseId
-            ? {
-                ...c,
-                notes: note,
-                last_contact_date: new Date().toISOString(),
-              }
-            : c
-        )
-      );
+      logAudit('collection_case', caseId, 'follow_up_recorded', note);
+    } catch (err: any) {
+      notify('error', err?.message || 'Could not save the note');
     }
-    logAudit('collection_case', caseId, 'follow_up_recorded', note);
   };
 
   if (!sessionChecked) {
@@ -657,7 +406,7 @@ export default function Home() {
           <div className="flex items-center space-x-2">
             <span className={`w-2 h-2 rounded-full ${isLiveConnected ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'}`} />
             <span className="font-medium text-[#0C3B2E]">
-              {isLiveConnected ? 'Backend Status: Connected to Real PostgreSQL & Microservices Gateway' : 'Backend Status: Connecting to Live Gateway (Fallback Active)'}
+              {isLiveConnected ? 'Backend Status: Connected to Real PostgreSQL & Microservices Gateway' : 'Backend Status: Not connected'}
             </span>
           </div>
           {statusMessage && (
@@ -668,6 +417,21 @@ export default function Home() {
         </div>
       </div>
 
+      {notice && (
+        <div
+          className={`border-b py-2 px-4 text-xs ${
+            notice.kind === 'error' ? 'bg-red-50 border-red-200 text-red-800' : 'bg-emerald-50 border-emerald-200 text-emerald-800'
+          }`}
+        >
+          <div className="max-w-7xl mx-auto flex items-center justify-between gap-3">
+            <span className="font-medium">{notice.message}</span>
+            <button onClick={() => setNotice(null)} className="font-bold px-2" aria-label="Dismiss">
+              ×
+            </button>
+          </div>
+        </div>
+      )}
+
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8">
         {currentRole !== 'customer' && activeTab === 'portal' && <PendingApprovals />}
         {isLoading && applications.length === 0 ? (
@@ -675,6 +439,8 @@ export default function Home() {
             <div className="w-8 h-8 border-4 border-[#0C3B2E] border-t-transparent rounded-full animate-spin mb-4" />
             <p className="text-sm text-[#0C3B2E] font-medium">Syncing with LoanFlow backend...</p>
           </div>
+        ) : activeTab === 'rules' && currentRole === 'manager' ? (
+          <RulesManager />
         ) : activeTab === 'analytics' && currentRole !== 'customer' ? (
           <AnalyticsDashboard
             applications={applications}
@@ -684,6 +450,7 @@ export default function Home() {
           />
         ) : currentRole === 'customer' ? (
           <CustomerPortal
+            customerName={user.full_name}
             applications={applications}
             loanAccount={loanAccount}
             onNewApplication={handleNewApplication}
@@ -700,6 +467,7 @@ export default function Home() {
             onCalculateLimit={handleCalculateLimit}
             onSubmitToManager={handleSubmitToManager}
             onUpdateCollectionNote={handleUpdateCollectionNote}
+            onLoadDetails={loadDetails}
           />
         ) : (
           <ManagerApprovalDesk

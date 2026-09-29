@@ -1,6 +1,7 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
+import { DocumentReview } from '@/components/DocumentReview';
 import {
   ApplicationItem,
   DocumentItem,
@@ -35,6 +36,7 @@ interface UnderwriterWorkbenchProps {
   onCalculateLimit: (appId: string) => void;
   onSubmitToManager: (appId: string, remarks: string) => void;
   onUpdateCollectionNote: (caseId: string, note: string) => void;
+  onLoadDetails: (appId: string) => void;
 }
 
 export const UnderwriterWorkbench: React.FC<UnderwriterWorkbenchProps> = ({
@@ -46,6 +48,7 @@ export const UnderwriterWorkbench: React.FC<UnderwriterWorkbenchProps> = ({
   onCalculateLimit,
   onSubmitToManager,
   onUpdateCollectionNote,
+  onLoadDetails,
 }) => {
   const [selectedAppId, setSelectedAppId] = useState<string>(applications[0]?.id || '');
   const [activeTab, setActiveTab] = useState<'docs' | 'rules' | 'risk' | 'limit' | 'submit'>('docs');
@@ -65,6 +68,12 @@ export const UnderwriterWorkbench: React.FC<UnderwriterWorkbenchProps> = ({
   });
 
   const activeApp = applications.find((a) => a.id === selectedAppId) || filteredApps[0];
+
+  // Documents and rule results are not part of the application list: load them for the open file
+  const activeAppId = activeApp?.id;
+  useEffect(() => {
+    if (activeAppId) onLoadDetails(activeAppId);
+  }, [activeAppId, onLoadDetails]);
 
   return (
     <div className="space-y-6">
@@ -300,69 +309,27 @@ export const UnderwriterWorkbench: React.FC<UnderwriterWorkbenchProps> = ({
                   <div className="flex items-center justify-between">
                     <div>
                       <h4 className="font-bold text-[#0C3B2E] text-sm">Underwriting Document Verification</h4>
-                      <p className="text-xs text-[#5e6d65]">Review uploaded files, cross-check hashes, and verify or flag discrepancies.</p>
+                      <p className="text-xs text-[#5e6d65]">Review each uploaded file with the fraud-detection result, then verify or reject it.</p>
                     </div>
                   </div>
 
                   <div className="space-y-3">
                     {activeApp.documents && activeApp.documents.length > 0 ? (
                       activeApp.documents.map((doc) => (
-                        <div key={doc.id} className="p-4 rounded-xl bg-[#F7F8F5] border border-[#E5E9E1] space-y-3">
-                          <div className="flex items-start justify-between">
-                            <div>
-                              <div className="flex items-center space-x-2">
-                                <span className="font-bold text-xs text-[#0C3B2E]">{doc.document_type}</span>
-                                <span
-                                  className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
-                                    doc.status === 'Verified'
-                                      ? 'bg-emerald-100 text-emerald-800'
-                                      : doc.status === 'Mismatch'
-                                      ? 'bg-red-100 text-red-800'
-                                      : 'bg-amber-100 text-amber-800'
-                                  }`}
-                                >
-                                  {doc.status}
-                                </span>
-                              </div>
-                              <p className="text-xs text-[#5e6d65] mt-1 font-mono">{doc.file_name} • {(doc.file_size / 1024).toFixed(0)} KB</p>
-                              <p className="text-[10px] text-[#5e6d65] font-mono mt-0.5">SHA-256: {doc.file_hash}</p>
-                              {doc.remarks && <p className="text-xs text-[#0C3B2E] font-medium mt-1">Remark: {doc.remarks}</p>}
-                            </div>
-                          </div>
-
-                          {/* Verification Actions */}
-                          <div className="pt-3 border-t border-[#E5E9E1] flex flex-col sm:flex-row items-center justify-between gap-3">
-                            <input
-                              type="text"
-                              placeholder="Add underwriter remarks..."
-                              value={docRemarks[doc.id] || ''}
-                              onChange={(e) =>
-                                setDocRemarks({ ...docRemarks, [doc.id]: e.target.value })
-                              }
-                              className="w-full sm:w-auto flex-1 text-xs px-3 py-1.5 rounded-lg border border-[#E5E9E1] bg-white outline-none"
-                            />
-                            <div className="flex items-center space-x-2 shrink-0">
-                              <button
-                                onClick={() =>
-                                  onVerifyDocument(doc.id, 'Verified', docRemarks[doc.id] || 'Verified against bank bureau standards')
-                                }
-                                className="px-3 py-1.5 text-xs font-bold rounded-lg bg-emerald-700 text-white hover:bg-emerald-800 transition-all flex items-center space-x-1"
-                              >
-                                <CheckCircle2 className="w-3.5 h-3.5" />
-                                <span>Verify</span>
-                              </button>
-                              <button
-                                onClick={() =>
-                                  onVerifyDocument(doc.id, 'Mismatch', docRemarks[doc.id] || 'Data mismatch found')
-                                }
-                                className="px-3 py-1.5 text-xs font-bold rounded-lg bg-red-700 text-white hover:bg-red-800 transition-all flex items-center space-x-1"
-                              >
-                                <XCircle className="w-3.5 h-3.5" />
-                                <span>Flag Mismatch</span>
-                              </button>
-                            </div>
-                          </div>
-                        </div>
+                        <DocumentReview
+                          key={doc.id}
+                          doc={doc}
+                          remarks={docRemarks[doc.id] || ''}
+                          onRemarksChange={(value) => setDocRemarks({ ...docRemarks, [doc.id]: value })}
+                          onVerify={(status) =>
+                            onVerifyDocument(
+                              doc.id,
+                              status,
+                              docRemarks[doc.id] ||
+                                (status === 'Verified' ? 'Verified by officer after document review' : 'Rejected by officer after document review')
+                            )
+                          }
+                        />
                       ))
                     ) : (
                       <p className="text-xs text-center py-6 text-[#5e6d65]">No documents uploaded yet.</p>

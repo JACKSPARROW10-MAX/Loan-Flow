@@ -57,6 +57,7 @@ SERVICE_MAP = {
     "/documents": settings.loan_app_service_url,
     "/servicing": settings.loan_app_service_url,
     "/collection": settings.loan_app_service_url,
+    "/rules": settings.loan_app_service_url,
     "/analytics": settings.loan_app_service_url,
     "/fraud": settings.loan_app_service_url,
     "/notifications": settings.notification_service_url,
