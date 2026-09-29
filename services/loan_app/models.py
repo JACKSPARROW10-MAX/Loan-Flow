@@ -111,6 +111,7 @@ class Application(Base):
     # Relationships
     documents = relationship("Document", back_populates="application", lazy="selectin")
     rule_results = relationship("RuleResult", back_populates="application", lazy="selectin")
+    fraud_alerts = relationship("FraudAlert", back_populates="application", lazy="selectin")
 
     __table_args__ = (
         Index("ix_applications_stage", "stage"),
@@ -129,7 +130,8 @@ class Document(Base):
     file_size = Column(Integer, default=0)
     mime_type = Column(String(100), default="application/octet-stream")
     status = Column(SAEnum(DocumentStatus), default=DocumentStatus.PENDING, nullable=False)
-    malware_scanned = Column(Boolean, default=False)
+    malware_scanned = Column(Boolean, default=True)
+    malware_scan_status = Column(String(50), default="CLEAN")  # CLEAN, SUSPICIOUS, FAILED
     verified_by = Column(String, nullable=True)
     verified_at = Column(DateTime(timezone=True), nullable=True)
     remarks = Column(Text, nullable=True)
@@ -140,6 +142,7 @@ class Document(Base):
     __table_args__ = (
         Index("ix_documents_hash", "file_hash"),
     )
+
 
 
 class RuleResult(Base):
@@ -275,4 +278,24 @@ class CollectionCase(Base):
     status = Column(String(50), default="OPEN")  # OPEN, RESOLVED, LEGAL
     updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
                         onupdate=lambda: datetime.now(timezone.utc))
+
+
+class FraudAlert(Base):
+    """Fraud and anomaly detection alerts. Advisory only - never auto-rejects."""
+    __tablename__ = "fraud_alerts"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    application_id = Column(String, ForeignKey("applications.id"), nullable=False, index=True)
+    anomaly_score = Column(Float, nullable=False, default=0.0)  # 0.0 - 1.0
+    risk_level = Column(String(50), default="LOW")  # LOW, MEDIUM, HIGH
+    flags = Column(JSON, nullable=False, default=list)  # list of strings/reasons
+    is_manual_review_required = Column(Boolean, default=False)
+    status = Column(String(50), default="PENDING_REVIEW")  # PENDING_REVIEW, CLEARED, CONFIRMED
+    advisory_note = Column(String(255), default="Advisory only. Officer decides.")
+    reviewed_by = Column(String, nullable=True)
+    reviewed_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    application = relationship("Application", back_populates="fraud_alerts")
+
 

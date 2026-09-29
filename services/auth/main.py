@@ -186,6 +186,8 @@ async def login(request: Request, body: LoginRequest, response: Response, db: As
 
     return {
         "message": "Login successful",
+        "access_token": token,
+        "token": token,
         "user": {
             "id": user.id,
             "username": user.username,

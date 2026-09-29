@@ -23,7 +23,7 @@ interface CustomerPortalProps {
   applications: ApplicationItem[];
   loanAccount?: LoanAccountItem;
   onNewApplication: (data: Partial<ApplicationItem>) => void;
-  onUploadDocument: (appId: string, docType: string, fileName: string, fileHash: string) => boolean;
+  onUploadDocument: (appId: string, docType: string, fileName: string, fileHash: string, file?: File) => boolean | Promise<boolean>;
   onPayEmi: (accountId: string, amount: number) => void;
 }
 
@@ -76,17 +76,24 @@ export const CustomerPortal: React.FC<CustomerPortalProps> = ({
     return idx === -1 ? 0 : idx;
   };
 
-  // Mock document upload with duplicate check demo
-  const handleFileUpload = (docType: string, e: React.ChangeEvent<HTMLInputElement>) => {
+  // Upload with real SHA-256 hash calculation and duplicate detection
+  const handleFileUpload = async (docType: string, e: React.ChangeEvent<HTMLInputElement>) => {
     setDocUploadError(null);
     const file = e.target.files?.[0];
     if (!file || !activeApp) return;
 
-    // Simulate simple hash check
-    const mockHash = `hash_${file.name.replace(/\s+/g, '_')}_${file.size}`;
-    const success = onUploadDocument(activeApp.id, docType, file.name, mockHash);
-    if (!success) {
-      setDocUploadError(`Duplicate detected! The file "${file.name}" has already been uploaded previously.`);
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      const hashBuffer = await crypto.subtle.digest('SHA-256', arrayBuffer);
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      const fileHash = hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
+
+      const success = await onUploadDocument(activeApp.id, docType, file.name, fileHash, file);
+      if (!success) {
+        setDocUploadError(`Duplicate detected! The file "${file.name}" (SHA-256: ${fileHash.substring(0, 12)}...) has already been uploaded previously.`);
+      }
+    } catch (err: any) {
+      setDocUploadError(err.message || 'Upload failed');
     }
   };
 

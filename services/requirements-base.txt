@@ -13,3 +13,4 @@ python-multipart==0.0.6
 supabase==2.3.0
 storage3==0.7.0
 slowapi==0.1.9
+reportlab>=4.0.0

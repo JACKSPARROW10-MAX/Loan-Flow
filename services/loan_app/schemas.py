@@ -96,6 +96,7 @@ class DocumentResponse(BaseModel):
     file_size: int
     status: str
     malware_scanned: bool
+    malware_scan_status: Optional[str] = "CLEAN"
     verified_by: Optional[str]
     verified_at: Optional[datetime]
     remarks: Optional[str]
@@ -264,6 +265,28 @@ class CollectionFollowUpRequest(BaseModel):
     status: Optional[str] = "OPEN"
 
 
+class FraudCheckRequest(BaseModel):
+    statement_income: Optional[float] = None
+    force_recheck: bool = False
+
+
+class FraudAlertResponse(BaseModel):
+    id: str
+    application_id: str
+    anomaly_score: float
+    risk_level: str
+    flags: list[str]
+    is_manual_review_required: bool
+    status: str
+    advisory_note: str = "Advisory only. Officer decides."
+    reviewed_by: Optional[str] = None
+    reviewed_at: Optional[datetime] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 # ═══════════════════════ Assessment Report & Analytics ═══════════════════════
 
 class AssessmentReportResponse(BaseModel):
@@ -273,6 +296,7 @@ class AssessmentReportResponse(BaseModel):
     rules: list[RuleResultResponse]
     risk: dict
     limit: dict
+    fraud_alerts: list[FraudAlertResponse] = []
     maker_checker: dict
     audit_history: list[AuditLogResponse]
 
@@ -285,4 +309,5 @@ class AnalyticsSummaryResponse(BaseModel):
     total_disbursed_volume: float
     active_loans_count: int
     delinquency_metrics: dict[str, float]
+
 

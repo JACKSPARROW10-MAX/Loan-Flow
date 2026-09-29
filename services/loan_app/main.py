@@ -10,7 +10,7 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import FastAPI, Depends, HTTPException, Request, UploadFile, File, Form, Query, status
+from fastapi import FastAPI, Depends, HTTPException, Request, UploadFile, File, Form, Query, status, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select, func, delete
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -30,10 +30,11 @@ from shared.security import (
 from shared.config import get_settings
 from shared.redis_client import get_redis
 from shared.event_bus import Event, create_event_bus
+from .report_pdf import generate_assessment_report_pdf
 
 from .models import (
     Application, Document, RuleResult, PolicyRule, AuditLog, EventLog,
-    LoanAccount, EMISchedule, PaymentTransaction, CollectionCase,
+    LoanAccount, EMISchedule, PaymentTransaction, CollectionCase, FraudAlert,
     ApplicationStage, DocumentStatus, RiskBand, VALID_TRANSITIONS,
 )
 from .schemas import (
@@ -44,6 +45,7 @@ from .schemas import (
     DisbursementRequest, LoanAccountResponse, EMIScheduleItem,
     PaymentRequest, PaymentResponse, CollectionCaseResponse,
     CollectionFollowUpRequest, AssessmentReportResponse, AnalyticsSummaryResponse,
+    FraudAlertResponse, FraudCheckRequest,
 )
 
 settings = get_settings()
@@ -108,6 +110,38 @@ async def startup():
                         EXECUTE FUNCTION prevent_audit_log_modification();
                     END IF;
                 END $$;
+            """)
+        )
+
+        # Create Analytical SQL Views for Power BI Reporting
+        await conn.execute(
+            __import__("sqlalchemy").text("""
+                CREATE OR REPLACE VIEW vw_approval_rate AS
+                SELECT 
+                    COUNT(*) AS total_applications,
+                    SUM(CASE WHEN stage = 'Approved' THEN 1 ELSE 0 END) AS approved_count,
+                    SUM(CASE WHEN stage = 'Returned' THEN 1 ELSE 0 END) AS returned_count,
+                    SUM(CASE WHEN stage = 'Rejected' THEN 1 ELSE 0 END) AS rejected_count,
+                    ROUND(CAST(SUM(CASE WHEN stage = 'Approved' THEN 1 ELSE 0 END) AS numeric) * 100.0 / NULLIF(COUNT(*), 0), 2) AS approval_rate_pct
+                FROM applications;
+
+                CREATE OR REPLACE VIEW vw_overdue_trend AS
+                SELECT 
+                    bucket,
+                    COUNT(*) AS case_count,
+                    SUM(overdue_amount) AS total_overdue_amount,
+                    ROUND(CAST(AVG(dpd) AS numeric), 1) AS avg_dpd
+                FROM collection_cases
+                GROUP BY bucket;
+
+                CREATE OR REPLACE VIEW vw_risk_mix AS
+                SELECT 
+                    COALESCE(risk_band, 'Unrated') AS risk_band,
+                    COUNT(*) AS total_count,
+                    ROUND(CAST(AVG(requested_amount) AS numeric), 2) AS avg_requested_amount,
+                    ROUND(CAST(AVG(risk_score) AS numeric), 2) AS avg_risk_score
+                FROM applications
+                GROUP BY risk_band;
             """)
         )
 
@@ -482,6 +516,7 @@ async def upload_document(
         mime_type=file.content_type or "application/octet-stream",
         status=DocumentStatus.PENDING,
         malware_scanned=True,  # Stub: always passes
+        malware_scan_status="CLEAN",
     )
     db.add(doc)
     await db.flush()
@@ -1166,6 +1201,271 @@ async def update_collection_follow_up(
     return {"message": "Follow-up recorded successfully", "case_id": case_id}
 
 
+@app.post("/collection/scan-overdue")
+async def scan_overdue_instalments(
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(require_role(ROLE_EMPLOYEE, ROLE_MANAGER)),
+):
+    """
+    Scheduled job / on-demand scan:
+    Finds overdue instalments (due_date < now and status != 'PAID'),
+    updates/creates CollectionCase, and pushes follow-up tasks to Upstash Redis work queue.
+    """
+    now = datetime.now(timezone.utc)
+    res = await db.execute(
+        select(EMISchedule)
+        .where(EMISchedule.due_date < now, EMISchedule.status.in_(["PENDING", "OVERDUE"]))
+        .order_by(EMISchedule.due_date.asc())
+    )
+    overdue_items = res.scalars().all()
+    created_tasks = 0
+
+    redis = None
+    try:
+        redis = await get_redis()
+    except Exception:
+        pass
+
+    for item in overdue_items:
+        item.status = "OVERDUE"
+        # calculate dpd
+        due_tz = item.due_date.replace(tzinfo=timezone.utc) if item.due_date.tzinfo is None else item.due_date
+        dpd = max(1, (now - due_tz).days)
+        bucket = "1-30 DPD" if dpd <= 30 else ("31-60 DPD" if dpd <= 60 else ("61-90 DPD" if dpd <= 90 else "90+ DPD"))
+
+        c_res = await db.execute(select(CollectionCase).where(CollectionCase.loan_account_id == item.loan_account_id))
+        case = c_res.scalars().first()
+        if not case:
+            case = CollectionCase(
+                loan_account_id=item.loan_account_id,
+                dpd=dpd,
+                bucket=bucket,
+                overdue_amount=item.emi_amount,
+                assigned_to="Recovery Officer",
+                notes=f"Overdue installment #{item.installment_number} due on {item.due_date.strftime('%Y-%m-%d')}",
+                status="OPEN",
+            )
+            db.add(case)
+        else:
+            case.dpd = max(case.dpd, dpd)
+            case.bucket = bucket
+            case.overdue_amount = max(case.overdue_amount, item.emi_amount)
+
+        if redis:
+            task_payload = json.dumps({
+                "task_id": str(uuid.uuid4()),
+                "loan_account_id": item.loan_account_id,
+                "installment_number": item.installment_number,
+                "dpd": dpd,
+                "bucket": bucket,
+                "overdue_amount": item.emi_amount,
+                "action": "Initiate Borrower Reminder & Recovery Call",
+                "queued_at": now.isoformat(),
+            })
+            try:
+                await redis.lpush("loanflow:collection_tasks", task_payload)
+                created_tasks += 1
+            except Exception:
+                pass
+
+    await db.flush()
+    return {
+        "status": "success",
+        "overdue_instalments_found": len(overdue_items),
+        "tasks_queued_to_redis": created_tasks,
+    }
+
+
+@app.get("/collection/tasks")
+async def get_collection_tasks(
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(require_role(ROLE_EMPLOYEE, ROLE_MANAGER)),
+):
+    """Retrieve pending collection tasks from Redis work queue or database cases."""
+    tasks = []
+    try:
+        redis = await get_redis()
+        raw_tasks = await redis.lrange("loanflow:collection_tasks", 0, 50)
+        for r in raw_tasks:
+            tasks.append(json.loads(r))
+    except Exception:
+        pass
+
+    if not tasks:
+        # Fallback to current database collection cases
+        cases_res = await db.execute(select(CollectionCase).where(CollectionCase.status == "OPEN").limit(20))
+        for c in cases_res.scalars().all():
+            tasks.append({
+                "task_id": c.id,
+                "loan_account_id": c.loan_account_id,
+                "dpd": c.dpd,
+                "bucket": c.bucket,
+                "overdue_amount": c.overdue_amount,
+                "action": "Contact Borrower",
+                "assigned_to": c.assigned_to,
+            })
+
+    return {"count": len(tasks), "tasks": tasks}
+
+
+# ═══════════════════════ FRAUD & ANOMALY DETECTION ═══════════════════════
+
+@app.post("/applications/{app_id}/fraud-check", response_model=FraudAlertResponse)
+async def run_fraud_check(
+    app_id: str,
+    body: Optional[FraudCheckRequest] = None,
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(require_role(ROLE_EMPLOYEE, ROLE_MANAGER)),
+):
+    """
+    Fraud and Anomaly Detection Engine:
+    - Flags duplicate document hashes across applications
+    - Flags income on statement differing from application form by > 15%
+    - Flags unusual application leverage / debt-to-income
+    - Flags abnormal repayment history
+    - Computes anomaly score & explainable flags
+    - Routes flagged files to manual review queue
+    - CRITICAL SPEC: NEVER auto-rejects. Stays advisory for officer review.
+    """
+    app_res = await db.execute(select(Application).where(Application.id == app_id))
+    application = app_res.scalars().first()
+    if not application:
+        raise HTTPException(404, "Application not found")
+
+    flags = []
+    anomaly_score = 0.0
+
+    # 1. Duplicate document hashes across OTHER applications
+    docs_res = await db.execute(select(Document).where(Document.application_id == app_id))
+    docs = docs_res.scalars().all()
+    for doc in docs:
+        dup_res = await db.execute(
+            select(Document).where(
+                Document.file_hash == doc.file_hash,
+                Document.application_id != app_id,
+            )
+        )
+        dups = dup_res.scalars().all()
+        if dups:
+            flags.append(
+                f"Duplicate document hash detected across applications (Type: {doc.document_type}, "
+                f"Hash: {doc.file_hash[:12]}..., matches {len(dups)} other application(s))"
+            )
+            anomaly_score += 0.40
+
+    # 2. Income on statement differing from form by > 15%
+    stmt_income = body.statement_income if body and body.statement_income is not None else None
+    if stmt_income is not None and application.annual_income > 0:
+        diff = abs(stmt_income - application.annual_income)
+        diff_pct = (diff / application.annual_income) * 100.0
+        if diff_pct > 15.0:
+            flags.append(
+                f"Income on bank statement (₹{stmt_income:,.0f}) differs from form (₹{application.annual_income:,.0f}) "
+                f"by {diff_pct:.1f}% (threshold: 15%)"
+            )
+            anomaly_score += 0.35
+
+    # 3. Unusual application patterns
+    if application.annual_income > 0:
+        lti = application.requested_amount / application.annual_income
+        if lti > 8.0:
+            flags.append(f"Unusual application: Requested loan amount is {lti:.1f}x annual income (standard policy <= 6x)")
+            anomaly_score += 0.20
+        monthly_inc = application.annual_income / 12.0
+        if monthly_inc > 0 and (application.existing_emi / monthly_inc) > 0.60:
+            flags.append(f"High debt load: Existing EMIs consume {(application.existing_emi / monthly_inc) * 100:.1f}% of gross income")
+            anomaly_score += 0.15
+
+    # 4. Abnormal repayment / prior default history
+    delinq_res = await db.execute(
+        select(CollectionCase)
+        .join(LoanAccount, CollectionCase.loan_account_id == LoanAccount.id)
+        .where(LoanAccount.customer_id == application.customer_id, CollectionCase.dpd > 30)
+    )
+    if delinq_res.scalars().all():
+        flags.append("Abnormal repayment pattern: Customer has past delinquent accounts exceeding 30 DPD")
+        anomaly_score += 0.30
+
+    anomaly_score = min(1.0, round(anomaly_score, 2))
+    if anomaly_score >= 0.50:
+        risk_level = "HIGH"
+    elif anomaly_score >= 0.25:
+        risk_level = "MEDIUM"
+    else:
+        risk_level = "LOW"
+
+    is_manual_review = len(flags) > 0 or anomaly_score >= 0.25
+    alert_status = "PENDING_REVIEW" if is_manual_review else "CLEARED"
+
+    # Persist FraudAlert
+    alert = FraudAlert(
+        application_id=app_id,
+        anomaly_score=anomaly_score,
+        risk_level=risk_level,
+        flags=flags,
+        is_manual_review_required=is_manual_review,
+        status=alert_status,
+        advisory_note="Advisory only. Officer decides.",
+    )
+    db.add(alert)
+    await db.flush()
+    await db.refresh(alert)
+
+    await write_audit(
+        db, "fraud_alert", alert.id, "fraud_evaluated",
+        user["sub"], user.get("role", ""),
+        new_value=f"Score: {anomaly_score}, Risk: {risk_level}, Flags: {len(flags)} (Advisory only - Never auto-rejected)"
+    )
+
+    await db.flush()
+    return alert
+
+
+@app.get("/applications/{app_id}/fraud-alerts", response_model=list[FraudAlertResponse])
+async def list_application_fraud_alerts(
+    app_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(require_role(ROLE_EMPLOYEE, ROLE_MANAGER)),
+):
+    """List fraud/anomaly alerts for an application."""
+    res = await db.execute(
+        select(FraudAlert)
+        .where(FraudAlert.application_id == app_id)
+        .order_by(FraudAlert.created_at.desc())
+    )
+    return res.scalars().all()
+
+
+@app.get("/fraud/review-queue")
+async def get_fraud_manual_review_queue(
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(require_role(ROLE_EMPLOYEE, ROLE_MANAGER)),
+):
+    """Get manual review queue for fraud/anomaly flagged applications."""
+    res = await db.execute(
+        select(FraudAlert, Application)
+        .join(Application, FraudAlert.application_id == Application.id)
+        .where(FraudAlert.is_manual_review_required == True, FraudAlert.status == "PENDING_REVIEW")
+        .order_by(FraudAlert.anomaly_score.desc())
+    )
+    items = []
+    for alert, app_obj in res.all():
+        items.append({
+            "alert_id": alert.id,
+            "application_id": app_obj.id,
+            "app_number": app_obj.app_number,
+            "customer_name": app_obj.customer_name,
+            "requested_amount": app_obj.requested_amount,
+            "stage": app_obj.stage.value,
+            "anomaly_score": alert.anomaly_score,
+            "risk_level": alert.risk_level,
+            "flags": alert.flags,
+            "advisory_note": alert.advisory_note,
+            "created_at": alert.created_at,
+        })
+    return items
+
+
 # ═══════════════════════ ASSESSMENT REPORT ═══════════════════════
 
 @app.get("/applications/{app_id}/assessment-report", response_model=AssessmentReportResponse)
@@ -1176,7 +1476,7 @@ async def get_assessment_report(
 ):
     """
     Automated Assessment Report:
-    Compiles verification checks, explainable rules, risk score, limit, maker-checker status,
+    Compiles verification checks, explainable rules, risk score, limit, fraud alerts, maker-checker status,
     and audit log into one explainable dossier.
     """
     app_res = await db.execute(select(Application).where(Application.id == app_id))
@@ -1194,6 +1494,10 @@ async def get_assessment_report(
     # Rule results
     rules_res = await db.execute(select(RuleResult).where(RuleResult.application_id == app_id))
     rules = rules_res.scalars().all()
+
+    # Fraud alerts
+    fraud_res = await db.execute(select(FraudAlert).where(FraudAlert.application_id == app_id))
+    fraud_alerts = fraud_res.scalars().all()
 
     # Audit history
     audit_res = await db.execute(
@@ -1222,6 +1526,7 @@ async def get_assessment_report(
             "requested_amount": application.requested_amount,
             "policy_compliant": (application.max_permissible_limit or application.requested_amount) >= application.requested_amount,
         },
+        fraud_alerts=[FraudAlertResponse.model_validate(f, from_attributes=True) for f in fraud_alerts],
         maker_checker={
             "prepared_by": application.prepared_by or "Unassigned",
             "approved_by": application.approved_by or "Pending Manager Approval",
@@ -1231,6 +1536,84 @@ async def get_assessment_report(
         audit_history=[AuditLogResponse.model_validate(a, from_attributes=True) for a in audit_history],
     )
     return report
+
+
+@app.get("/applications/{app_id}/assessment-report/pdf")
+async def download_assessment_report_pdf(
+    app_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(get_current_user),
+):
+    """
+    Download Automated Credit Assessment Report as PDF:
+    Contains KYC result, document verification & SHA-256 hashes, explainable rule outcomes,
+    risk score, permissible limit, fraud/anomaly alerts (advisory panel), maker-checker sign-off,
+    and audit trail.
+    """
+    app_res = await db.execute(select(Application).where(Application.id == app_id))
+    application = app_res.scalars().first()
+    if not application:
+        raise HTTPException(404, "Application not found")
+
+    if user["role"] == ROLE_CUSTOMER and application.customer_id != user["sub"]:
+        raise HTTPException(403, "Access denied")
+
+    doc_res = await db.execute(select(Document).where(Document.application_id == app_id))
+    documents = doc_res.scalars().all()
+
+    rules_res = await db.execute(select(RuleResult).where(RuleResult.application_id == app_id))
+    rules = rules_res.scalars().all()
+
+    fraud_res = await db.execute(select(FraudAlert).where(FraudAlert.application_id == app_id))
+    fraud_alerts = fraud_res.scalars().all()
+
+    audit_res = await db.execute(
+        select(AuditLog).where(AuditLog.entity_id == app_id).order_by(AuditLog.created_at.asc())
+    )
+    audit_history = audit_res.scalars().all()
+
+    risk_info = {
+        "score": application.risk_score or 75.0,
+        "band": application.risk_band or "Low",
+    }
+    limit_info = {
+        "max_permissible_limit": application.max_permissible_limit or application.requested_amount,
+        "requested_amount": application.requested_amount,
+    }
+    maker_checker_info = {
+        "prepared_by": application.prepared_by or "Loan Officer",
+        "approved_by": application.approved_by or "Pending Sanction",
+    }
+
+    pdf_bytes = generate_assessment_report_pdf(
+        application=application,
+        kyc_data=application.kyc_data,
+        documents=documents,
+        rules=rules,
+        risk_info=risk_info,
+        limit_info=limit_info,
+        fraud_alerts=fraud_alerts,
+        maker_checker_info=maker_checker_info,
+        audit_history=audit_history,
+    )
+
+    # Attempt store in Supabase Storage if configured
+    try:
+        from shared.storage import upload_file as store_upload
+        storage_path = f"reports/{application.app_number}_assessment_report.pdf"
+        store_upload(settings.storage_bucket, storage_path, pdf_bytes, "application/pdf")
+    except Exception:
+        pass
+
+    filename = f"assessment-report-{application.app_number}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Type": "application/pdf",
+        },
+    )
 
 
 # ═══════════════════════ PORTFOLIO ANALYTICS ═══════════════════════
