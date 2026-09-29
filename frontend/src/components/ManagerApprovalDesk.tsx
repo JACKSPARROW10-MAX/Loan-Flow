@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { ApplicationItem, AssessmentReport, Role } from '@/types';
 import {
   ShieldCheck,
@@ -20,7 +20,10 @@ import {
 
 interface ManagerApprovalDeskProps {
   currentRole: Role;
+  reviewerName: string;
+  reviewerId: string;
   applications: ApplicationItem[];
+  onLoadDetails: (appId: string) => void;
   onApprove: (appId: string, remarks: string) => void;
   onReturn: (appId: string, remarks: string) => void;
   onReject: (appId: string, remarks: string) => void;
@@ -29,7 +32,10 @@ interface ManagerApprovalDeskProps {
 
 export const ManagerApprovalDesk: React.FC<ManagerApprovalDeskProps> = ({
   currentRole,
+  reviewerName,
+  reviewerId,
   applications,
+  onLoadDetails,
   onApprove,
   onReturn,
   onReject,
@@ -40,16 +46,22 @@ export const ManagerApprovalDesk: React.FC<ManagerApprovalDeskProps> = ({
     (a) => a.stage === 'With Manager' || a.stage === 'Approved'
   );
 
-  const [selectedAppId, setSelectedAppId] = useState<string>(
-    managerQueue[0]?.id || applications[0]?.id || ''
-  );
+  const [selectedAppId, setSelectedAppId] = useState<string>('');
   const [managerRemarks, setManagerRemarks] = useState('Sanctioned as per bank retail credit policy.');
   const [sanctionRate, setSanctionRate] = useState(8.75);
 
-  const activeApp = applications.find((a) => a.id === selectedAppId) || managerQueue[0] || applications[0];
+  const activeApp = managerQueue.find((a) => a.id === selectedAppId) || managerQueue[0];
+
+  // Documents and rule results are loaded per application
+  const activeAppId = activeApp?.id;
+  useEffect(() => {
+    if (activeAppId) onLoadDetails(activeAppId);
+  }, [activeAppId, onLoadDetails]);
 
   // Maker-checker simulation: if currentRole is 'employee', they prepared it and cannot approve!
-  const isMaker = currentRole === 'employee' || activeApp?.prepared_by === 'cust-101';
+  const isMaker = currentRole === 'employee' || (!!activeApp?.prepared_by && activeApp.prepared_by === reviewerId);
+  const shortId = (id?: string | null) => (id ? id.slice(0, 8) : '');
+  const segregated = !!activeApp?.prepared_by && activeApp.prepared_by !== reviewerId;
   const isManager = currentRole === 'manager';
 
   return (
@@ -72,7 +84,7 @@ export const ManagerApprovalDesk: React.FC<ManagerApprovalDeskProps> = ({
         <div className="p-3 rounded-xl bg-[#07261d]/80 border border-[#165443] text-xs">
           <span className="text-[10px] text-[#8eb494] uppercase tracking-wider font-semibold">Active Reviewer</span>
           <p className="font-bold text-white mt-0.5">
-            {isManager ? 'Priya Mehta (Branch Manager - Checker)' : 'Rahul Verma (Underwriter - Maker)'}
+            {reviewerName} ({isManager ? 'Branch Manager - Checker' : 'Underwriter - Maker'})
           </p>
         </div>
       </div>
@@ -119,7 +131,7 @@ export const ManagerApprovalDesk: React.FC<ManagerApprovalDeskProps> = ({
                   </div>
 
                   <div className="mt-3 pt-2 border-t border-[#F1F3EE] flex items-center justify-between text-[11px] text-[#5e6d65]">
-                    <span>Prepared by: {app.prepared_by || 'Rahul Verma'}</span>
+                    <span>Prepared by: {app.prepared_by ? `officer ${shortId(app.prepared_by)}` : 'not recorded'}</span>
                     <span className="text-[#6D9773] font-semibold">Review Dossier →</span>
                   </div>
                 </div>
@@ -161,13 +173,17 @@ export const ManagerApprovalDesk: React.FC<ManagerApprovalDeskProps> = ({
                   <div>
                     <h4 className="text-xs font-bold text-[#0C3B2E]">Maker-Checker Dual Control</h4>
                     <p className="text-[11px] text-[#5e6d65]">
-                      Prepared by: <span className="font-semibold text-[#0C3B2E]">{activeApp.prepared_by || 'Rahul Verma (emp-201)'}</span> • Checker: <span className="font-semibold text-[#0C3B2E]">Priya Mehta (mgr-301)</span>
+                      Prepared by: <span className="font-semibold text-[#0C3B2E]">{activeApp.prepared_by ? `officer ${shortId(activeApp.prepared_by)}` : 'not recorded'}</span> • Checker: <span className="font-semibold text-[#0C3B2E]">{reviewerName}</span>
                     </p>
                   </div>
                 </div>
 
-                <span className="px-3 py-1 rounded-full text-[11px] font-bold bg-emerald-100 text-emerald-800 shrink-0">
-                  Segregation Verified
+                <span
+                  className={`px-3 py-1 rounded-full text-[11px] font-bold shrink-0 ${
+                    segregated ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'
+                  }`}
+                >
+                  {segregated ? 'Segregation Verified' : 'Maker and checker not separated'}
                 </span>
               </div>
             </div>
@@ -188,15 +204,19 @@ export const ManagerApprovalDesk: React.FC<ManagerApprovalDeskProps> = ({
                       <Lock className="w-3.5 h-3.5 text-[#6D9773]" />
                       <span>KYC Verification</span>
                     </span>
-                    <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-emerald-100 text-emerald-800">
-                      Verified
+                    <span
+                      className={`text-[10px] font-bold px-2 py-0.5 rounded ${
+                        activeApp.kyc_verified ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'
+                      }`}
+                    >
+                      {activeApp.kyc_verified ? 'Verified' : 'Not verified'}
                     </span>
                   </div>
                   <p className="text-xs text-[#5e6d65]">
-                    Aadhaar: <span className="font-mono text-[#0C3B2E] font-semibold">{activeApp.kyc_data?.aadhaar_number || '•••• •••• 9012'}</span>
+                    Aadhaar: <span className="font-mono text-[#0C3B2E] font-semibold">{activeApp.kyc_data?.aadhaar_number || 'Not available'}</span>
                   </p>
                   <p className="text-xs text-[#5e6d65]">
-                    PAN: <span className="font-mono text-[#0C3B2E] font-semibold">{activeApp.kyc_data?.pan_number || '••••••234F'}</span>
+                    PAN: <span className="font-mono text-[#0C3B2E] font-semibold">{activeApp.kyc_data?.pan_number || 'Not available'}</span>
                   </p>
                 </div>
 
@@ -207,11 +227,32 @@ export const ManagerApprovalDesk: React.FC<ManagerApprovalDeskProps> = ({
                       <Cpu className="w-3.5 h-3.5 text-[#BB8A52]" />
                       <span>Policy Rules Engine</span>
                     </span>
-                    <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-emerald-100 text-emerald-800">
-                      Passed 5 / 5
+                    <span
+                      className={`text-[10px] font-bold px-2 py-0.5 rounded ${
+                        activeApp.eligibility_total > 0 && activeApp.eligibility_passed === activeApp.eligibility_total
+                          ? 'bg-emerald-100 text-emerald-800'
+                          : 'bg-amber-100 text-amber-800'
+                      }`}
+                    >
+                      {activeApp.eligibility_total > 0
+                        ? `Passed ${activeApp.eligibility_passed} / ${activeApp.eligibility_total}`
+                        : 'Not run'}
                     </span>
                   </div>
-                  <p className="text-xs text-[#5e6d65]">Income &gt; ₹3L, EMI ratio &lt; 50%, Salaried Tier-1 employer, CIBIL 785.</p>
+                  {activeApp.rule_results && activeApp.rule_results.length > 0 ? (
+                    <ul className="space-y-1">
+                      {activeApp.rule_results.map((r) => (
+                        <li key={r.id} className="text-[11px] text-[#5e6d65] flex gap-1.5">
+                          <span className={r.passed ? 'text-emerald-700' : 'text-red-700'}>{r.passed ? '✓' : '✗'}</span>
+                          <span>
+                            <span className="font-semibold text-[#0C3B2E]">{r.rule_name}</span>: {r.reason}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="text-xs text-[#5e6d65]">The officer has not run the eligibility rules yet.</p>
+                  )}
                 </div>
 
                 {/* 3. Risk Score */}
@@ -222,11 +263,12 @@ export const ManagerApprovalDesk: React.FC<ManagerApprovalDeskProps> = ({
                       <span>Credit Risk Score</span>
                     </span>
                     <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-[#FFBA00] text-[#0C3B2E]">
-                      {activeApp.risk_band || 'Low'} Risk
+                      {activeApp.risk_band ? `${activeApp.risk_band} Risk` : 'Not scored'}
                     </span>
                   </div>
-                  <p className="text-sm font-extrabold text-[#0C3B2E]">{activeApp.risk_score || 82.5} / 100</p>
-                  <p className="text-xs text-[#5e6d65]">Model v2.1 LendingTree • Probability of Default: 0.8%</p>
+                  <p className="text-sm font-extrabold text-[#0C3B2E]">
+                    {activeApp.risk_score != null ? `${activeApp.risk_score} / 100` : 'Not scored yet'}
+                  </p>
                 </div>
 
                 {/* 4. Permissible Limit */}
@@ -236,14 +278,26 @@ export const ManagerApprovalDesk: React.FC<ManagerApprovalDeskProps> = ({
                       <Calculator className="w-3.5 h-3.5 text-[#BB8A52]" />
                       <span>Max Permissible Limit</span>
                     </span>
-                    <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-emerald-100 text-emerald-800">
-                      Approved
+                    <span
+                      className={`text-[10px] font-bold px-2 py-0.5 rounded ${
+                        activeApp.max_permissible_limit == null
+                          ? 'bg-amber-100 text-amber-800'
+                          : activeApp.requested_amount <= activeApp.max_permissible_limit
+                          ? 'bg-emerald-100 text-emerald-800'
+                          : 'bg-red-100 text-red-800'
+                      }`}
+                    >
+                      {activeApp.max_permissible_limit == null
+                        ? 'Not calculated'
+                        : activeApp.requested_amount <= activeApp.max_permissible_limit
+                        ? 'Within limit'
+                        : 'Exceeds limit'}
                     </span>
                   </div>
                   <p className="text-sm font-extrabold text-[#6D9773]">
-                    ₹{(activeApp.max_permissible_limit || 8500000).toLocaleString()}
+                    {activeApp.max_permissible_limit != null ? `₹${activeApp.max_permissible_limit.toLocaleString()}` : 'Not calculated yet'}
                   </p>
-                  <p className="text-xs text-[#5e6d65]">Requested ₹{activeApp.requested_amount.toLocaleString()} is fully covered.</p>
+                  <p className="text-xs text-[#5e6d65]">Requested ₹{activeApp.requested_amount.toLocaleString()}</p>
                 </div>
               </div>
 
@@ -257,7 +311,10 @@ export const ManagerApprovalDesk: React.FC<ManagerApprovalDeskProps> = ({
                       className="p-2.5 rounded-lg bg-[#F7F8F5] border border-[#E5E9E1] flex items-center justify-between text-xs"
                     >
                       <span className="font-semibold text-[#0C3B2E]">{doc.document_type}: {doc.file_name}</span>
-                      <span className="font-mono text-[10px] text-[#5e6d65]">SHA: {doc.file_hash.substring(0, 16)}...</span>
+                      <span className="font-mono text-[10px] text-[#5e6d65]">
+                        {doc.status}
+                        {doc.fraud_flag ? ` • fraud: ${doc.fraud_flag.toLowerCase().replace('_', ' ')}` : ''} • SHA: {doc.file_hash.substring(0, 12)}...
+                      </span>
                     </div>
                   ))}
                 </div>

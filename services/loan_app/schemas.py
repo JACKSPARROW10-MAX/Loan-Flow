@@ -50,6 +50,7 @@ class ApplicationResponse(BaseModel):
     prepared_by: Optional[str]
     approved_by: Optional[str]
     kyc_verified: bool
+    kyc_data: Optional[dict] = None
     sla_days: int
     sla_deadline: Optional[datetime]
     created_at: datetime

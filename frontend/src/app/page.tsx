@@ -472,6 +472,9 @@ export default function Home() {
         ) : (
           <ManagerApprovalDesk
             currentRole={currentRole}
+            reviewerName={user.full_name}
+            reviewerId={user.id}
+            onLoadDetails={loadDetails}
             applications={applications}
             onApprove={handleApprove}
             onReturn={handleReturn}

@@ -153,13 +153,8 @@ export async function fetchApplications(): Promise<ApplicationItem[]> {
     ...app,
     documents: app.documents || [],
     rule_results: app.rule_results || [],
-    kyc_verified: app.kyc_verified ?? true,
-    kyc_data: app.kyc_data || {
-      aadhaar_number: '********9012',
-      pan_number: '******234F',
-      phone: '******3210',
-      verified: true,
-    },
+    kyc_verified: app.kyc_verified ?? false,
+    kyc_data: app.kyc_data || undefined,
   }));
 }
 

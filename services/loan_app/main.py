@@ -318,7 +318,7 @@ async def create_application(
     return application
 
 
-@app.get("/applications", response_model=list[ApplicationListItem])
+@app.get("/applications", response_model=list[ApplicationResponse])
 async def list_applications(
     request: Request,
     stage: Optional[str] = Query(None),
