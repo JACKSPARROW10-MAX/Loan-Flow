@@ -27,7 +27,7 @@ from httpx import AsyncClient, ASGITransport
 
 # ═══════════════════════ POINT TESTS TO POSTGRESQL ═══════════════════════
 # Must use PostgreSQL – never SQLite!
-os.environ["DATABASE_URL"] = "postgresql://postgres:postgres@127.0.0.1:5434/loanflow_test"
+os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@127.0.0.1:5434/loanflow_test")
 os.environ["JWT_SECRET"] = "test-secret-key-1234567890-test"
 os.environ["JWT_ALGORITHM"] = "HS256"
 os.environ["JWT_EXPIRE_MINUTES"] = "120"
