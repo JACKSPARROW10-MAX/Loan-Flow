@@ -8,6 +8,7 @@ services:
   - type: web
     name: loanflow-gateway
     runtime: docker
+    plan: free
     dockerfilePath: services/gateway/Dockerfile
     dockerContext: .
     envVars:
@@ -17,6 +18,7 @@ services:
   - type: web
     name: loanflow-auth
     runtime: docker
+    plan: free
     dockerfilePath: services/auth/Dockerfile
     dockerContext: .
     envVars:
@@ -26,6 +28,7 @@ services:
   - type: web
     name: loanflow-loan-app
     runtime: docker
+    plan: free
     dockerfilePath: services/loan_app/Dockerfile
     dockerContext: .
     envVars:
@@ -35,6 +38,7 @@ services:
   - type: web
     name: loanflow-mock-kyc
     runtime: docker
+    plan: free
     dockerfilePath: services/mock_kyc/Dockerfile
     dockerContext: .
     envVars:
@@ -44,6 +48,7 @@ services:
   - type: web
     name: loanflow-risk
     runtime: docker
+    plan: free
     dockerfilePath: services/risk/Dockerfile
     dockerContext: .
     envVars:
@@ -53,6 +58,7 @@ services:
   - type: web
     name: loanflow-audit
     runtime: docker
+    plan: free
     dockerfilePath: services/audit/Dockerfile
     dockerContext: .
     envVars:
@@ -62,6 +68,7 @@ services:
   - type: web
     name: loanflow-document
     runtime: docker
+    plan: free
     dockerfilePath: services/document/Dockerfile
     dockerContext: .
     envVars:
