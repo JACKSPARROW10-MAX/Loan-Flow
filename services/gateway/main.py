@@ -100,6 +100,12 @@ async def proxy_request(request: Request, target_url: str):
         return response
 
 
+@app.get("/health")
+async def health():
+    # Must be registered before the catch-all proxy route below.
+    return {"status": "ok", "service": "gateway"}
+
+
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
 async def gateway(request: Request, path: str):
     """Route requests to the appropriate backend service."""
@@ -120,11 +126,6 @@ async def gateway(request: Request, path: str):
                 )
 
     return JSONResponse(status_code=404, content={"detail": f"No service found for /{path}"})
-
-
-@app.get("/health")
-async def health():
-    return {"status": "ok", "service": "gateway"}
 
 
 if __name__ == "__main__":
