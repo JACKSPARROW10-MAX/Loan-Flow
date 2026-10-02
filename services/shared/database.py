@@ -31,7 +31,7 @@ AsyncSessionLocal = async_sessionmaker(
     class_=AsyncSession,
     expire_on_commit=False,
 )
-
+#automation testing
 
 class Base(DeclarativeBase):
     """Base class for all ORM models."""
